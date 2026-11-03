@@ -1,0 +1,1839 @@
+"""Tests for RemoteInferenceClient."""
+
+import asyncio
+import json
+import pickle
+import threading
+import time
+from typing import Dict, List, Optional
+
+import aiohttp
+import httpx
+import numpy as np
+import orjson
+import pytest
+import pytest_asyncio
+import ray
+import uvicorn
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+
+from skyrl.backends.skyrl_train.inference_servers import (
+    remote_inference_client as remote_client_module,
+)
+from skyrl.backends.skyrl_train.inference_servers.common import get_open_port
+from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
+    PackedArrayKey,
+    PackedField,
+    decode_packed_routed_experts,
+    pack_ndarray,
+    pack_routed_experts,
+    pack_sample_support,
+    unpack_ndarray,
+)
+from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+    SKYRL_LORA_ADAPTER_NAME,
+    InferenceServerHTTPError,
+    InferenceServerTimeoutError,
+    PauseMode,
+    RemoteGenerateClient,
+    RemoteInferenceClient,
+)
+from skyrl.backends.skyrl_train.inference_servers.setup import (
+    build_new_inference_client,
+)
+from skyrl.train.config import SkyRLTrainConfig
+
+_SUPPORT_DTYPES = frozenset({np.dtype(np.float32)})
+_ROUTES = np.arange(12).reshape(3, 2, 2)
+
+
+async def _fake_detokenize(token_id_lists: List[List[int]]) -> List[str]:
+    return ["text"] * len(token_id_lists)
+
+
+_SUPPORT = np.arange(6, dtype=np.float32).reshape(2, 3)
+
+
+def _packed_generate_body(*, two_blobs: bool) -> dict:
+    choice: dict = {
+        "token_ids": [1, 2, 3],
+        "finish_reason": "stop",
+        PackedField.ROUTED_EXPERTS.value: pack_routed_experts(_ROUTES),
+    }
+    if two_blobs:
+        choice[PackedField.ROLLOUT_SAMPLE_SUPPORT.value] = pack_ndarray(_SUPPORT, allowed_dtypes=_SUPPORT_DTYPES)
+    return {"choices": [choice]}
+
+
+def create_mock_vllm_server(server_id: int) -> FastAPI:
+    """Create a mock vLLM server with standard endpoints."""
+    app = FastAPI()
+    app.state.last_generate_features = None
+    app.state.last_generate_model = None
+    app.state.last_generate_sampling_params = None
+    app.state.last_chat_model = None
+    app.state.last_completion_model = None
+    app.state.last_render_model = None
+    # Per-server LoRA registry: lora_name -> lora_path
+    app.state.lora_registry = {}
+    app.state.fetch_weights_requests = []
+    # Session ids received via /finish_session, in arrival order.
+    app.state.finished_sessions = []
+    # Number of /get_world_size hits, used to assert client-side caching.
+    app.state.world_size_calls = 0
+    app.state.drifted_body_calls = 0
+    app.state.flaky_body_calls = 0
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @app.post("/test/packed_body")
+    async def packed_body(two_blobs: bool = False):
+        return Response(content=orjson.dumps(_packed_generate_body(two_blobs=two_blobs)), media_type="application/json")
+
+    @app.post("/test/drifted_packed_body")
+    async def drifted_packed_body():
+        app.state.drifted_body_calls += 1
+        # stdlib json spaces its separators, so the splice prefix no longer matches.
+        content = json.dumps(_packed_generate_body(two_blobs=False)).encode()
+        return Response(content=content, media_type="application/json")
+
+    @app.post("/test/flaky_packed_body")
+    async def flaky_packed_body():
+        app.state.flaky_body_calls += 1
+        if app.state.flaky_body_calls == 1:
+            return Response(content=b"<html>gateway hiccup</html>", media_type="application/json", status_code=502)
+        return Response(content=orjson.dumps(_packed_generate_body(two_blobs=True)), media_type="application/json")
+
+    @app.post("/test/reset_packed_body_calls")
+    async def reset_packed_body_calls():
+        app.state.drifted_body_calls = 0
+        app.state.flaky_body_calls = 0
+        return {"status": "ok"}
+
+    @app.get("/test/packed_body_calls")
+    async def packed_body_calls():
+        return {"drifted": app.state.drifted_body_calls, "flaky": app.state.flaky_body_calls}
+
+    @app.post("/test/bad_request_text")
+    async def bad_request_text():
+        return PlainTextResponse("prompt too long", status_code=400)
+
+    @app.post("/test/control_hang")
+    async def control_hang():
+        await asyncio.sleep(30)
+        return {"status": "ok"}
+
+    @app.post("/test/control_plain_error")
+    async def control_plain_error():
+        return PlainTextResponse("engine is dead", status_code=502)
+
+    @app.post("/test/control_json_array_error")
+    async def control_json_array_error():
+        return JSONResponse(["engine is dead"], status_code=502)
+
+    @app.post("/test/control_malformed_json_error")
+    async def control_malformed_json_error():
+        return Response(content="<html>bad gateway</html>", media_type="application/json", status_code=502)
+
+    @app.post("/finish_session")
+    async def finish_session(session_id: str = Query(...)):
+        app.state.finished_sessions.append(session_id)
+        return {"status": "ok", "session_id": session_id}
+
+    @app.get("/test/finished")
+    async def get_finished():
+        return {"finished": list(app.state.finished_sessions)}
+
+    @app.get("/test/last_generate_features")
+    async def get_last_generate_features():
+        return {"features": app.state.last_generate_features}
+
+    @app.get("/test/last_generate_sampling_params")
+    async def get_last_generate_sampling_params():
+        return app.state.last_generate_sampling_params
+
+    @app.get("/test/last_models")
+    async def get_last_models():
+        return {
+            "generate": app.state.last_generate_model,
+            "chat": app.state.last_chat_model,
+            "completion": app.state.last_completion_model,
+            "render": app.state.last_render_model,
+        }
+
+    @app.get("/test/lora_registry")
+    async def get_lora_registry():
+        return {"registry": dict(app.state.lora_registry)}
+
+    @app.get("/get_world_size")
+    async def get_world_size():
+        app.state.world_size_calls += 1
+        return {"world_size": 2}  # Simulate TP=2
+
+    @app.get("/test/world_size_calls")
+    async def get_world_size_calls():
+        return {"count": app.state.world_size_calls}
+
+    @app.post("/v1/completions")
+    async def completions(request: Request):
+        body = await request.json()
+        app.state.last_completion_model = body.get("model")
+        prompts = body.get("prompt", [])
+        n_prompts = len(prompts) if isinstance(prompts, list) else 1
+        return {
+            "choices": [
+                {"index": i, "text": f"Response {i} from server {server_id}", "finish_reason": "stop"}
+                for i in range(n_prompts)
+            ],
+            "model": body.get("model"),
+        }
+
+    @app.post("/skyrl/v1/generate")
+    @app.post("/inference/v1/generate")
+    async def generate(request: Request):
+        body = await request.json()  # Consume body
+        sp = body.get("sampling_params", {})
+        app.state.last_generate_sampling_params = sp
+        input_token_ids = body.get("token_ids", [])
+        app.state.last_generate_model = body.get("model")
+        n = sp.get("n", 1)
+        # If logprobs is explicitly set (sample path), use n for num_choices.
+        # Otherwise (generate path), use len(token_ids) for per-prompt responses.
+        if "logprobs" in sp:
+            num_choices = n
+        else:
+            num_choices = 1
+
+        response: dict = {
+            "choices": [
+                {
+                    "request_id": "dummy",
+                    "token_ids": [i, i + 1, i + 2],
+                    "finish_reason": "stop",
+                    "logprobs": {"content": [{"logprob": -0.1 * (i + 1)}]},
+                }
+                for i in range(num_choices)
+            ]
+        }
+        if request.url.path == "/skyrl/v1/generate":
+            routes = np.arange(12).reshape(3, 2, 2)
+            response["choices"][0]["routed_experts"] = pack_routed_experts(routes)
+
+        features = body.get("features")
+        app.state.last_generate_features = features
+        if features is not None:
+            response["features"] = features
+
+        # Mock prompt_logprobs when requested via sampling_params
+        pl = sp.get("prompt_logprobs")
+        # vLLM returns k or k+1 logprobs per position (extra entry when
+        # the prompt token falls outside the top-k).
+        if pl is not None and input_token_ids:
+            prompt_logprobs = [None]  # position 0: no prior context
+            for idx in range(1, len(input_token_ids)):
+                position_dict = {
+                    str(input_token_ids[idx]): {
+                        "logprob": -0.5 * idx,
+                        "rank": 1,
+                        "decoded_token": None,
+                    }
+                }
+                # If topk > 0, add extra entries
+                if pl > 0:
+                    for extra in range(pl):
+                        fake_token_id = 9000 + idx * 10 + extra
+                        position_dict[str(fake_token_id)] = {
+                            "logprob": -1.0 * idx - 0.1 * extra,
+                            "rank": extra + 2,
+                            "decoded_token": None,
+                        }
+                prompt_logprobs.append(position_dict)
+            response["prompt_logprobs"] = prompt_logprobs
+
+        return response
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request):
+        body = await request.json()
+        app.state.last_chat_model = body.get("model")
+        return {
+            "choices": [{"message": {"content": f"Chat from server {server_id}"}}],
+            "model": body.get("model"),
+        }
+
+    @app.post("/v1/chat/completions/render")
+    async def render_chat_completion(request: Request):
+        body = await request.json()
+        app.state.last_render_model = body.get("model")
+        messages = body.get("messages", [])
+
+        # Count image_url parts across all messages.
+        num_images = sum(
+            1
+            for msg in messages
+            if isinstance(msg.get("content"), list)
+            for c in msg["content"]
+            if c.get("type") == "image_url"
+        )
+
+        features = None
+        if num_images > 0:
+            # Each image gets 100 placeholder tokens.  Token IDs are laid out as:
+            # [0..3] preamble, then 100 tokens per image, then [N..N+5] suffix.
+            placeholder_size = 100
+            preamble_len = 4
+            total_len = preamble_len + num_images * placeholder_size + 6
+
+            mm_hashes = []
+            mm_placeholders = []
+            kwargs_items = []
+            for i in range(num_images):
+                offset = preamble_len + i * placeholder_size
+                mm_hashes.append(f"hash-{i}")
+                mm_placeholders.append({"offset": offset, "length": placeholder_size})
+                kwargs_items.append(f"mock-encoded-tensor-{i}")
+
+            features = {
+                "mm_hashes": {"image": mm_hashes},
+                "mm_placeholders": {"image": mm_placeholders},
+                "kwargs_data": {"image": kwargs_items},
+            }
+        else:
+            total_len = 10
+
+        return {
+            "request_id": f"chatcmpl-mock-{server_id}",
+            "token_ids": list(range(total_len)),
+            "features": features,
+            "sampling_params": {"temperature": 0.7, "max_tokens": 100},
+            "model": body.get("model", "test"),
+            "stream": body.get("stream", False),
+            "stream_options": body.get("stream_options"),
+            "cache_salt": None,
+            "priority": 0,
+            "kv_transfer_params": None,
+        }
+
+    @app.post("/tokenize")
+    async def tokenize(request: Request):
+        return {"tokens": [1, 2, 3]}
+
+    @app.post("/detokenize")
+    async def detokenize(request: Request):
+        return {"prompt": "hello world"}
+
+    # Control plane endpoints
+    @app.post("/pause")
+    async def pause(request: Request, mode: str = "abort", clear_cache: str = "true"):
+        return {"status": "paused", "server_id": server_id, "mode": mode, "clear_cache": clear_cache}
+
+    @app.post("/resume")
+    async def resume():
+        return {"status": "resumed", "server_id": server_id}
+
+    @app.get("/is_paused")
+    async def is_paused():
+        # Mock always returns not paused for basic tests
+        return {"is_paused": False}
+
+    @app.get("/is_sleeping")
+    async def is_sleeping():
+        return {"is_sleeping": False}
+
+    @app.post("/sleep")
+    async def sleep(level: int = 2, tags: Optional[List[str]] = Query(None)):
+        return {"status": "sleeping", "server_id": server_id, "level": level, "tags": tags}
+
+    @app.post("/wake_up")
+    async def wake_up(tags: Optional[List[str]] = Query(None)):
+        return {"status": "awake", "server_id": server_id, "tags": tags}
+
+    @app.post("/reset_prefix_cache")
+    async def reset_prefix_cache(request: Request):
+        return {"status": "cache_reset", "server_id": server_id, "body": await request.json()}
+
+    @app.post("/init_weight_transfer_engine")
+    async def init_weight_transfer_engine(request: Request):
+        return {"status": "ok", "server_id": server_id, "body": await request.json()}
+
+    @app.post("/update_weights")
+    async def update_weights(request: Request):
+        return {"status": "ok", "server_id": server_id, "body": await request.json()}
+
+    @app.post("/fetch_weights")
+    async def fetch_weights(request: Request):
+        body = await request.json()
+        app.state.fetch_weights_requests.append(body)
+        return {"status": "ok", "server_id": server_id, "body": body}
+
+    @app.post("/skyrl/v1/load_lora_adapter")
+    async def load_lora_adapter(request: Request):
+        body = await request.json()
+        lora_name = body.get("lora_name")
+        lora_path = body.get("lora_path")
+        if lora_name is None or lora_path is None:
+            return JSONResponse(
+                status_code=400,
+                content={"object": "error", "message": "missing lora_name/lora_path", "type": "BadRequest"},
+            )
+        app.state.lora_registry[lora_name] = lora_path
+        return PlainTextResponse(f"Success: LoRA adapter '{lora_name}' added successfully on server {server_id}.")
+
+    @app.post("/v1/unload_lora_adapter")
+    async def unload_lora_adapter(request: Request):
+        body = await request.json()
+        lora_name = body.get("lora_name")
+        if lora_name is None or lora_name not in app.state.lora_registry:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "object": "error",
+                    "message": f"adapter '{lora_name}' not found",
+                    "type": "NotFoundError",
+                },
+            )
+        del app.state.lora_registry[lora_name]
+        return PlainTextResponse(f"Success: LoRA adapter '{lora_name}' removed successfully on server {server_id}.")
+
+    return app
+
+
+@pytest.mark.asyncio
+async def test_build_new_inference_client_uses_served_model_name_for_chat_requests(mock_servers):
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.policy.model.path = "Qwen/Qwen2.5-1.5B-Instruct"
+    cfg.generator.inference_engine.served_model_name = "served-alias"
+    cfg.generator.inference_engine.external_proxy_url = mock_servers["proxy_url"]
+    cfg.generator.inference_engine.external_server_urls = mock_servers["server_urls"]
+
+    client, server_setup = build_new_inference_client(cfg, tokenizer=None)
+
+    try:
+        assert server_setup.proxy_url == mock_servers["proxy_url"]
+        assert server_setup.server_urls == mock_servers["server_urls"]
+
+        await client.chat_completion(
+            {
+                "json": {"messages": [{"role": "user", "content": "hi"}]},
+                "headers": {},
+            }
+        )
+        captured = await _get_last_models(mock_servers["server_urls"])
+        assert captured[0]["chat"] == "served-alias"
+    finally:
+        await client.teardown()
+
+
+def start_server(port: int, server_id: int) -> uvicorn.Server:
+    """Start a mock server, return the server instance."""
+    app = create_mock_vllm_server(server_id)
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="error")
+    server = uvicorn.Server(config)
+
+    def run():
+        asyncio.run(server.serve())
+
+    threading.Thread(target=run, daemon=True).start()
+    return server
+
+
+def wait_ready(url: str, timeout: float = 5.0) -> bool:
+    """Wait for server to become healthy."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            if httpx.get(f"{url}/health", timeout=1.0).status_code == 200:
+                return True
+        except httpx.RequestError:
+            time.sleep(0.1)
+    return False
+
+
+@pytest.fixture(scope="module")
+def mock_servers():
+    """Start mock vLLM servers, return proxy_url and server_urls."""
+    servers: List[uvicorn.Server] = []
+    ports = [get_open_port(), get_open_port()]
+    server_urls = [f"http://127.0.0.1:{p}" for p in ports]
+
+    for i, port in enumerate(ports):
+        servers.append(start_server(port, server_id=i))
+
+    for url in server_urls:
+        assert wait_ready(url), f"Server {url} failed to start"
+
+    # proxy_url defaults to first server; can be replaced with router URL later
+    yield {"proxy_url": server_urls[0], "server_urls": server_urls}
+
+    # Cleanup
+    for server in servers:
+        server.should_exit = True
+    time.sleep(0.3)
+
+
+@pytest_asyncio.fixture
+async def client(mock_servers):
+    """Create a RemoteInferenceClient for data/control plane tests."""
+    client = RemoteInferenceClient(
+        proxy_url=mock_servers["proxy_url"],
+        server_urls=mock_servers["server_urls"],
+        data_parallel_size=1,
+    )
+    yield client
+    await client.teardown()
+
+
+def _start_finish_session_error_server(port: int) -> uvicorn.Server:
+    """Start a mock router whose /finish_session always returns HTTP 500."""
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @app.post("/finish_session")
+    async def finish_session(session_id: str = Query(...)):
+        return JSONResponse(status_code=500, content={"error": "boom"})
+
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="error")
+    server = uvicorn.Server(config)
+    threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True).start()
+    return server
+
+
+@pytest.fixture(scope="module")
+def error_router():
+    """A router URL whose /finish_session always errors with HTTP 500."""
+    port = get_open_port()
+    server = _start_finish_session_error_server(port)
+    url = f"http://127.0.0.1:{port}"
+    assert wait_ready(url), "error router failed to start"
+    yield url
+    server.should_exit = True
+    time.sleep(0.2)
+
+
+def _assert_picklable_http_error(exc: BaseException, *, status: int, message: str) -> None:
+    assert isinstance(exc, InferenceServerHTTPError)
+    restored = pickle.loads(pickle.dumps(exc))
+    assert type(restored) is InferenceServerHTTPError
+    assert (restored.status, restored.message, str(restored)) == (status, message, str(exc))
+
+
+class TestInferenceServerHTTPError:
+    """aiohttp's ClientResponseError can't be pickled, so Ray would replace it with a bare RayError."""
+
+    def test_survives_a_ray_task(self):
+        @ray.remote
+        def fail():
+            exc = InferenceServerHTTPError("POST", "http://127.0.0.1:1/pause", 503, "overloaded", [("X-A", "1")])
+            exc.add_note("while pausing")
+            raise exc
+
+        with pytest.raises(InferenceServerHTTPError) as exc_info:
+            ray.get(fail.remote())
+        assert exc_info.value.status == 503
+        assert exc_info.value.message == "overloaded"
+        assert exc_info.value.request_info.method == "POST"
+        assert exc_info.value.headers["X-A"] == "1"
+        assert "while pausing" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "endpoint,message",
+        [
+            ("/test/control_plain_error", "engine is dead"),
+            ("/test/control_json_array_error", "Bad Gateway"),
+            ("/test/control_malformed_json_error", "<html>bad gateway</html>"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_control_plane_error_body(self, client, mock_servers, endpoint, message):
+        with pytest.raises(InferenceServerHTTPError) as exc_info:
+            await client._call_server(mock_servers["server_urls"][0], endpoint)
+        _assert_picklable_http_error(exc_info.value, status=502, message=message)
+
+
+class TestControlPlaneTimeout:
+    @pytest.mark.asyncio
+    async def test_hung_control_plane_call_raises_picklable_timeout(self, client, mock_servers, monkeypatch):
+        monkeypatch.setattr(remote_client_module, "SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S", 0.2)
+        url = mock_servers["server_urls"][0]
+        with pytest.raises(InferenceServerTimeoutError) as exc_info:
+            await asyncio.wait_for(client._call_server(url, "/test/control_hang"), timeout=10)
+        err = exc_info.value
+        assert (err.method, err.url, err.timeout_s) == ("POST", f"{url}/test/control_hang", 0.2)
+        restored = pickle.loads(pickle.dumps(err))
+        assert (restored.method, restored.url, restored.timeout_s, str(restored)) == (
+            err.method,
+            err.url,
+            err.timeout_s,
+            str(err),
+        )
+
+
+class TestRemoteInferenceClientInit:
+    """Test client initialization and serialization."""
+
+    def test_serialization(self, mock_servers):
+        """Client can be pickled and unpickled."""
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="test-model",
+            data_parallel_size=1,
+        )
+
+        # Materialize the generate client so the assertion below actually exercises
+        # __getstate__ dropping it, rather than passing because it was never created.
+        assert client._get_generate_client() is not None
+
+        # Pickle and unpickle
+        pickled = pickle.dumps(client)
+        restored = pickle.loads(pickled)
+
+        assert restored.proxy_url == client.proxy_url
+        assert restored.server_urls == client.server_urls
+        assert restored.model_name == client.model_name
+        # No sessions should survive unpickling
+        assert restored._generate_client is None
+
+
+class TestDataPlane:
+    """Test data plane methods."""
+
+    @pytest.mark.asyncio
+    async def test_generate(self, client):
+        """Test generate method."""
+        input_batch = {
+            "prompt_token_ids": [[1, 2, 3], [4, 5, 6]],
+            "sampling_params": {"max_tokens": 100},
+        }
+        result = await client.generate(input_batch)
+
+        assert "responses" in result
+        assert "stop_reasons" in result
+        assert len(result["responses"]) == 2
+        assert all(r == "stop" for r in result["stop_reasons"])
+        # response_ids are tokenized from the response
+        assert len(result["response_ids"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_generate_with_session_id(self, client):
+        """Test generate with session ID for consistent routing."""
+        input_batch = {
+            "prompt_token_ids": [[1, 2, 3]],
+            "session_ids": ["test-session"],
+        }
+        result = await client.generate(input_batch)
+        assert len(result["responses"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_generate_decodes_packed_routed_experts(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+            enable_return_routed_experts=True,
+        )
+        try:
+            result = await client.generate({"prompt_token_ids": [[1, 2, 3]], "routed_experts_prompt_starts": [1]})
+            async with httpx.AsyncClient() as http:
+                captured = (await http.get(f"{mock_servers['proxy_url']}/test/last_generate_sampling_params")).json()
+        finally:
+            await client.teardown()
+
+        assert len(result["rollout_expert_indices"]) == 1
+        assert result["rollout_expert_indices"][0].dtype == np.uint8
+        assert np.array_equal(result["rollout_expert_indices"][0], np.arange(12).reshape(3, 2, 2))
+        assert captured["routed_experts_prompt_start"] == 1
+
+    @pytest.mark.asyncio
+    async def test_external_generator_requests_sample_support(self, monkeypatch):
+        generate_client = RemoteGenerateClient(proxy_url="http://unused")
+        captured = {}
+
+        async def fake_post(url, json, headers, *, packed_side_channels=False):
+            captured.update(url=url, json=json, headers=headers, packed_side_channels=packed_side_channels)
+            return {
+                "choices": [
+                    {
+                        "token_ids": [7],
+                        "finish_reason": "stop",
+                        "logprobs": {"content": [{"logprob": -0.1}]},
+                        PackedField.ROLLOUT_SAMPLE_SUPPORT.value: pack_sample_support(
+                            np.array([[7, 8]], dtype=np.int32)
+                        ),
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(generate_client, "_post", fake_post)
+        result = await generate_client.generate(
+            prompt_token_ids=[1, 2],
+            sampling_params={},
+            session_id=None,
+            model="default",
+            return_sample_support=True,
+        )
+
+        assert captured["url"].endswith("/skyrl/v1/generate")
+        assert captured["json"]["return_sample_support"] is True
+        assert captured["packed_side_channels"] is True
+        assert np.array_equal(result.sample_support, np.array([[7, 8]], dtype=np.int32))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("input_batch_opts", [{}, {"return_sample_support": False}])
+    async def test_sample_support_capture_is_opt_in_per_request(self, monkeypatch, input_batch_opts):
+        client = RemoteInferenceClient(
+            proxy_url="http://unused",
+            server_urls=["http://unused"],
+            data_parallel_size=1,
+            enable_return_sample_support_set=True,
+        )
+        captured = {}
+
+        async def fake_post(url, json, headers, *, packed_side_channels=False):
+            captured.update(url=url, json=json)
+            return {"choices": [{"token_ids": [1], "finish_reason": "stop"}]}
+
+        monkeypatch.setattr(client._get_generate_client(), "_post", fake_post)
+        monkeypatch.setattr(client, "detokenize", _fake_detokenize)
+
+        result = await client.generate({"prompt_token_ids": [[1, 2]], **input_batch_opts})
+
+        assert "return_sample_support" not in captured["json"]
+        assert captured["url"].endswith("/inference/v1/generate")
+        assert result["rollout_sample_support"] is None
+
+    @pytest.mark.asyncio
+    async def test_sample_support_capture_honours_an_explicit_opt_in(self, monkeypatch):
+        client = RemoteInferenceClient(
+            proxy_url="http://unused",
+            server_urls=["http://unused"],
+            data_parallel_size=1,
+            enable_return_sample_support_set=True,
+        )
+        captured = {}
+
+        async def fake_post(url, json, headers, *, packed_side_channels=False):
+            captured.update(url=url, json=json)
+            return {
+                "choices": [
+                    {
+                        "token_ids": [7],
+                        "finish_reason": "stop",
+                        PackedField.ROLLOUT_SAMPLE_SUPPORT.value: pack_sample_support(
+                            np.array([[7, 8]], dtype=np.int32)
+                        ),
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(client._get_generate_client(), "_post", fake_post)
+        monkeypatch.setattr(client, "detokenize", _fake_detokenize)
+
+        result = await client.generate({"prompt_token_ids": [[1, 2]], "return_sample_support": True})
+
+        assert captured["json"]["return_sample_support"] is True
+        assert np.array_equal(result["rollout_sample_support"][0], np.array([[7, 8]], dtype=np.int32))
+
+    @pytest.mark.asyncio
+    async def test_generate_rejects_list_routed_experts(self, monkeypatch):
+        client = RemoteInferenceClient(
+            proxy_url="http://unused",
+            server_urls=["http://unused"],
+            data_parallel_size=1,
+            enable_return_routed_experts=True,
+        )
+
+        async def return_list_routes(*args, **kwargs):
+            return {
+                "choices": [
+                    {
+                        "token_ids": [1],
+                        "finish_reason": "stop",
+                        "routed_experts": [[[0, 1]]],
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(client._get_generate_client(), "_post", return_list_routes)
+        with pytest.raises(ValueError, match="must return packed"):
+            await client._generate_single([1], {}, None, "model")
+
+    @pytest.mark.asyncio
+    async def test_chat_completion(self, client):
+        """Test chat completion method."""
+        request_payload = {
+            "json": {
+                "model": "test",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+            "headers": {},
+        }
+        result = await client.chat_completion(request_payload)
+        assert "choices" in result
+
+    @pytest.mark.asyncio
+    async def test_completion(self, client):
+        """Test completion method."""
+        request_payload = {
+            "json": {"model": "test", "prompt": "Hello"},
+            "headers": {},
+        }
+        result = await client.completion(request_payload)
+        assert "choices" in result
+
+    @pytest.mark.asyncio
+    async def test_tokenize(self, client):
+        """Test tokenize method."""
+        result = await client.tokenize(["hello", "world"])
+        assert len(result) == 2
+        assert result[0] == [1, 2, 3]  # Mock response
+
+    @pytest.mark.asyncio
+    async def test_detokenize(self, client):
+        """Test detokenize method."""
+        result = await client.detokenize([[1, 2, 3], [4, 5, 6]])
+        assert len(result) == 2
+        assert result[0] == "hello world"  # Mock response
+
+
+class TestPackedSideChannelBodies:
+    """Tests for response parsing with packed side channels."""
+
+    async def _post_packed(self, client, mock_servers, path: str, **kwargs):
+        return await client._get_generate_client()._post(
+            f"{mock_servers['proxy_url']}{path}", json={}, packed_side_channels=True, **kwargs
+        )
+
+    @pytest.mark.asyncio
+    async def test_splices_both_registered_fields(self, client, mock_servers):
+        body = await self._post_packed(client, mock_servers, "/test/packed_body?two_blobs=true")
+        choice = body["choices"][0]
+
+        assert isinstance(choice[PackedField.ROUTED_EXPERTS][PackedArrayKey.DATA], memoryview)
+        assert isinstance(choice[PackedField.ROLLOUT_SAMPLE_SUPPORT][PackedArrayKey.DATA], memoryview)
+        assert np.array_equal(decode_packed_routed_experts(choice[PackedField.ROUTED_EXPERTS]), _ROUTES)
+        support, _ = unpack_ndarray(choice[PackedField.ROLLOUT_SAMPLE_SUPPORT], allowed_dtypes=_SUPPORT_DTYPES, ndim=2)
+        assert np.array_equal(support, _SUPPORT)
+
+    @pytest.mark.asyncio
+    async def test_drifted_layout_raises_without_retrying(self, client, mock_servers):
+        await client._post(f"{mock_servers['proxy_url']}/test/reset_packed_body_calls", json={})
+
+        with pytest.raises(ValueError, match="layout drifted"):
+            await self._post_packed(client, mock_servers, "/test/drifted_packed_body")
+
+        async with httpx.AsyncClient() as http:
+            counts = (await http.get(f"{mock_servers['proxy_url']}/test/packed_body_calls")).json()
+        assert counts["drifted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_undecodable_body_is_retried_then_spliced(self, client, mock_servers):
+        await client._post(f"{mock_servers['proxy_url']}/test/reset_packed_body_calls", json={})
+
+        body = await self._post_packed(client, mock_servers, "/test/flaky_packed_body")
+
+        async with httpx.AsyncClient() as http:
+            counts = (await http.get(f"{mock_servers['proxy_url']}/test/packed_body_calls")).json()
+        assert counts["flaky"] == 2
+        assert np.array_equal(
+            decode_packed_routed_experts(body["choices"][0][PackedField.ROUTED_EXPERTS]),
+            _ROUTES,
+        )
+
+    @pytest.mark.asyncio
+    async def test_client_error_with_non_json_body_surfaces_the_text(self, client, mock_servers):
+        with pytest.raises(aiohttp.ClientResponseError, match="prompt too long") as exc_info:
+            await client._post(f"{mock_servers['proxy_url']}/test/bad_request_text", json={})
+        _assert_picklable_http_error(exc_info.value, status=400, message="prompt too long")
+
+    @pytest.mark.asyncio
+    async def test_non_routed_expert_generate_never_scans_the_body(self, client, monkeypatch):
+        def fail(*args, **kwargs):
+            raise AssertionError("the non-R3 path must not scan the response body")
+
+        monkeypatch.setattr(remote_client_module, "load_packed_body", fail)
+
+        result = await client.generate({"prompt_token_ids": [[1, 2, 3]]})
+        assert len(result["responses"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_routed_expert_generate_goes_through_the_splice(self, mock_servers, monkeypatch):
+        calls: List[int] = []
+        original = remote_client_module.load_packed_body
+
+        def counted(raw, **kwargs):
+            calls.append(len(raw))
+            return original(raw, **kwargs)
+
+        monkeypatch.setattr(remote_client_module, "load_packed_body", counted)
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+            enable_return_routed_experts=True,
+        )
+        try:
+            result = await client.generate({"prompt_token_ids": [[1, 2, 3]]})
+        finally:
+            await client.teardown()
+
+        assert len(calls) == 1
+        assert np.array_equal(result["rollout_expert_indices"][0], _ROUTES)
+
+
+class TestControlPlane:
+    """Test control plane methods (fan-out to all servers)."""
+
+    @pytest.mark.asyncio
+    async def test_pause_keep_mode(self, client):
+        """Test pause with KEEP mode (default) sends mode=keep and clear_cache=false."""
+        result = await client.pause(mode=PauseMode.KEEP)
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["status"] == 200
+            assert response["body"]["status"] == "paused"
+            assert response["body"]["mode"] == "keep"
+            assert response["body"]["clear_cache"] == "false"
+
+    @pytest.mark.asyncio
+    async def test_pause_abort_mode(self, client):
+        """Test pause with ABORT mode fans out to all servers with mode=abort."""
+        result = await client.pause(mode=PauseMode.ABORT)
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["status"] == 200
+            assert response["body"]["status"] == "paused"
+            assert response["body"]["mode"] == "abort"
+
+    @pytest.mark.asyncio
+    async def test_pause_wait_mode(self, client):
+        """Test pause with WAIT mode fans out to all servers with mode=wait."""
+        result = await client.pause(mode=PauseMode.WAIT)
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["status"] == 200
+            assert response["body"]["mode"] == "wait"
+
+    @pytest.mark.asyncio
+    async def test_pause_generation_uses_keep_mode(self, client):
+        """Test that pause_generation() alias uses KEEP mode."""
+        result = await client.pause_generation()
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["status"] == 200
+            assert response["body"]["mode"] == "keep"
+            assert response["body"]["clear_cache"] == "false"
+
+    @pytest.mark.asyncio
+    async def test_resume(self, client):
+        """Test resume fans out to all servers."""
+        await client.pause()
+
+        result = await client.resume()
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["status"] == 200
+
+    @pytest.mark.asyncio
+    async def test_sleep(self, client):
+        """Test sleep fans out to all servers."""
+        result = await client.sleep(level=2)
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["body"]["level"] == 2
+            assert response["body"]["tags"] is None
+
+    @pytest.mark.asyncio
+    async def test_sleep_with_tags(self, client):
+        """Test sleep with tags produces correct repeated query params."""
+        result = await client.sleep(level=1, tags=["weights", "kv_cache"])
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["body"]["level"] == 1
+            assert response["body"]["tags"] == ["weights", "kv_cache"]
+
+    @pytest.mark.asyncio
+    async def test_is_sleeping(self, client):
+        """Test is_sleeping fans out to all servers and unwraps response bodies."""
+        assert await client.is_sleeping() is False
+
+    @pytest.mark.asyncio
+    async def test_wake_up(self, client):
+        """Test wake_up fans out to all servers."""
+        result = await client.wake_up()
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["body"]["tags"] is None
+
+    @pytest.mark.asyncio
+    async def test_wake_up_with_tags(self, client):
+        """Test wake_up with tags produces correct repeated query params."""
+        result = await client.wake_up(tags=["weights"])
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["body"]["tags"] == ["weights"]
+
+    @pytest.mark.asyncio
+    async def test_reset_prefix_cache(self, client):
+        """Test reset_prefix_cache fans out to all servers with the request body."""
+        result = await client.reset_prefix_cache(reset_running_requests=True)
+        assert set(result) == set(client.server_urls)
+        for response in result.values():
+            assert response["body"]["status"] == "cache_reset"
+            assert response["body"]["body"] == {"reset_running_requests": True}
+
+
+class TestWeightSync:
+    """Test weight sync methods."""
+
+    # The init handshake and the start/update/finish lifecycle run on the
+    # trainer-side engines' blocking SkyrlWeightSyncClient
+    # (weight_sync/control_plane.py, covered by test_control_plane.py). Covered
+    # here is what this client drives from the driver.
+
+    @pytest.mark.asyncio
+    async def test_update_named_weights(self, client):
+        """Test update_weights fans out to all servers."""
+        update_info = {
+            "names": ["layer.weight"],
+            "dtype_names": ["bfloat16"],
+            "shapes": [[1024, 1024]],
+            "packed": True,
+        }
+        result = await client.update_named_weights(update_info)
+        assert set(result) == set(client.server_urls)
+        for response in result.values():
+            assert response["body"]["body"] == {"update_info": update_info}
+
+    @pytest.mark.asyncio
+    async def test_fetch_weights(self, client):
+        """Test fetch_weights fans out to /fetch_weights on all servers."""
+        result = await client.fetch_weights(
+            target_version=3,
+            sync_dir="gs://bucket/prefix",
+            uri="gs://bucket/prefix/delta-00000003",
+        )
+        assert len(result) == 2
+        for response in result.values():
+            assert response["body"]["body"] == {
+                "target_version": 3,
+                "sync_dir": "gs://bucket/prefix",
+                "uri": "gs://bucket/prefix/delta-00000003",
+            }
+
+
+class TestServerInfo:
+    """Test server info and world_size."""
+
+    @pytest.mark.asyncio
+    async def test_get_world_size(self, client):
+        """world_size sums across servers and is cached after the first call."""
+
+        async def _total_server_calls():
+            counts = await client._call_all_servers("/test/world_size_calls", {}, method="GET")
+            return sum(response["body"]["count"] for response in counts.values())
+
+        before = await _total_server_calls()
+
+        # First call fetches from all servers and sums (each mock reports 2, 2 servers = 4).
+        total_world_size, world_size_per_server = await client.get_world_size()
+        assert total_world_size == 4
+        assert world_size_per_server == 2
+        after_first = await _total_server_calls()
+        # It queried every server exactly once.
+        assert after_first - before == len(client.server_urls)
+
+        # Second call is served from the client-side cache — no further server queries.
+        total_world_size2, _ = await client.get_world_size()
+        assert total_world_size2 == 4
+        after_second = await _total_server_calls()
+        assert after_second - after_first == 0
+
+
+class TestSample:
+    """Test sample() method (Tinker API)."""
+
+    @pytest.mark.asyncio
+    async def test_sample(self, client):
+        """Test sample with n=1 returns correct structure and prompt_logprobs."""
+        request_payload = {
+            "json": {
+                "model": client.model_name,
+                "prompt": {"chunks": [{"tokens": [10, 20, 30]}]},
+                "num_samples": 1,
+                "sampling_params": {"temperature": 0.7, "max_tokens": 64},
+                "include_prompt_logprobs": True,
+            }
+        }
+        result = await client.sample(request_payload)
+
+        assert result["type"] == "sample"
+        assert len(result["sequences"]) == 1
+
+        seq = result["sequences"][0]
+        assert seq["tokens"] == [0, 1, 2]
+        assert seq["logprobs"] == [-0.1]
+        assert seq["stop_reason"] == "stop"
+
+        # prompt_logprobs: one float per prompt token, position 0 is None
+        pl = result["prompt_logprobs"]
+        assert pl is not None
+        assert len(pl) == 3
+        assert pl[0] is None
+        assert pl[1] == pytest.approx(-0.5)
+        assert pl[2] == pytest.approx(-1.0)
+        # topk not requested
+        assert result["topk_prompt_logprobs"] is None
+
+    @pytest.mark.asyncio
+    async def test_sample_n2(self, client):
+        """Test sample with n=2 returns two sequences and prompt_logprobs."""
+        request_payload = {
+            "json": {
+                "model": client.model_name,
+                "prompt": {"chunks": [{"tokens": [1, 2]}, {"tokens": [3]}]},
+                "num_samples": 2,
+                "sampling_params": {"temperature": 1.0, "max_tokens": 32},
+                "include_prompt_logprobs": True,
+            }
+        }
+        result = await client.sample(request_payload)
+
+        assert len(result["sequences"]) == 2
+        assert result["sequences"][0]["tokens"] == [0, 1, 2]
+        assert result["sequences"][1]["tokens"] == [1, 2, 3]
+        assert result["sequences"][0]["logprobs"] == [-0.1]
+        assert result["sequences"][1]["logprobs"] == [-0.2]
+
+        # prompt_logprobs shared across choices
+        pl = result["prompt_logprobs"]
+        assert pl is not None
+        assert len(pl) == 3
+        assert pl[0] is None
+
+    @pytest.mark.asyncio
+    async def test_sample_topk_prompt_logprobs(self, client):
+        """Test topk_prompt_logprobs returns both prompt_logprobs and topk tuples."""
+        request_payload = {
+            "json": {
+                "model": client.model_name,
+                "prompt": {"chunks": [{"tokens": [10, 20, 30]}]},
+                "num_samples": 1,
+                "sampling_params": {"temperature": 0.7, "max_tokens": 64},
+                "include_prompt_logprobs": True,
+                "topk_prompt_logprobs": 2,
+            }
+        }
+        result = await client.sample(request_payload)
+
+        pl = result["prompt_logprobs"]
+        assert pl is not None
+        assert len(pl) == 3
+        assert pl[0] is None
+        assert pl[1] == pytest.approx(-0.5)
+        assert pl[2] == pytest.approx(-1.0)
+
+        topk = result["topk_prompt_logprobs"]
+        assert topk is not None
+        assert len(topk) == 3
+        assert topk[0] is None
+        # Exactly top-k (2) entries per position, sorted by logprob descending
+        assert len(topk[1]) == 2
+        assert len(topk[2]) == 2
+        # Position 1: top-2 are token 20 at -0.5 and 9010 at -1.0 (9011 at -1.1 is dropped)
+        topk1 = dict(topk[1])
+        assert topk1[20] == pytest.approx(-0.5)
+        assert topk1[9010] == pytest.approx(-1.0)
+
+    @pytest.mark.asyncio
+    async def test_sample_topk_without_include_returns_none(self, client):
+        """topk_prompt_logprobs alone does not return prompt logprobs when include_prompt_logprobs is False."""
+        request_payload = {
+            "json": {
+                "model": client.model_name,
+                "prompt": {"chunks": [{"tokens": [10, 20, 30]}]},
+                "num_samples": 1,
+                "sampling_params": {"temperature": 0.7, "max_tokens": 64},
+                "topk_prompt_logprobs": 2,
+            }
+        }
+        result = await client.sample(request_payload)
+
+        assert result["prompt_logprobs"] is None
+        assert result["topk_prompt_logprobs"] is None
+
+    @pytest.mark.asyncio
+    async def test_sample_with_image(self, client):
+        """Sample with [text, image, text] calls render and splices tokens correctly."""
+        import base64
+
+        image_bytes = base64.b64encode(b"fake-jpeg-data").decode("ascii")
+        request_payload = {
+            "json": {
+                "model": client.model_name,
+                "prompt": {
+                    "chunks": [
+                        {"type": "encoded_text", "tokens": [100, 101, 102]},
+                        {
+                            "type": "image",
+                            "data": image_bytes,
+                            "format": "jpeg",
+                        },
+                        {"type": "encoded_text", "tokens": [200, 201]},
+                    ]
+                },
+                "num_samples": 1,
+                "sampling_params": {"temperature": 0.7, "max_tokens": 64},
+            }
+        }
+        result = await client.sample(request_payload)
+
+        assert result["type"] == "sample"
+        assert len(result["sequences"]) == 1
+
+        seq = result["sequences"][0]
+        assert "tokens" in seq
+        assert "logprobs" in seq
+        assert seq["stop_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_sample_with_image_asset_pointer(self, client):
+        """Sample with image_asset_pointer sends location URL to render."""
+        request_payload = {
+            "json": {
+                "model": client.model_name,
+                "prompt": {
+                    "chunks": [
+                        {"type": "encoded_text", "tokens": [10, 11]},
+                        {
+                            "type": "image_asset_pointer",
+                            "format": "png",
+                            "location": "https://example.com/image.png",
+                        },
+                        {"type": "encoded_text", "tokens": [20, 21]},
+                    ]
+                },
+                "num_samples": 1,
+                "sampling_params": {"temperature": 0.7, "max_tokens": 64},
+            }
+        }
+        result = await client.sample(request_payload)
+
+        assert result["type"] == "sample"
+        assert len(result["sequences"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_sample_text_only_no_features(self, client):
+        """Text-only sample does not include features in the generate payload."""
+        request_payload = {
+            "json": {
+                "model": client.model_name,
+                "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
+                "num_samples": 1,
+                "sampling_params": {"temperature": 0.7, "max_tokens": 64},
+            }
+        }
+        result = await client.sample(request_payload)
+
+        assert result["type"] == "sample"
+        assert len(result["sequences"]) == 1
+
+
+class TestRenderChatCompletion:
+    """Test render_chat_completion method (multimodal and text-only)."""
+
+    @pytest.mark.asyncio
+    async def test_render_chat_completion_basic(self, client):
+        """Text-only render returns correct top-level fields and features is None."""
+        request_payload = {
+            "json": {
+                "model": "test",
+                "messages": [{"role": "user", "content": "Hello, who are you?"}],
+            },
+        }
+        result = await client.render_chat_completion(request_payload)
+
+        assert result["request_id"] == "chatcmpl-mock-0"
+        assert result["token_ids"] == list(range(10))
+        assert result["sampling_params"] == {"temperature": 0.7, "max_tokens": 100}
+        assert result["model"] == "test"
+        assert result["features"] is None
+        assert result["stream"] is False
+        assert result["stream_options"] is None
+        assert result["cache_salt"] is None
+        assert result["priority"] == 0
+        assert result["kv_transfer_params"] is None
+
+    @pytest.mark.asyncio
+    async def test_render_chat_completion_multimodal(self, client):
+        """Multimodal render returns features with mm_hashes and mm_placeholders."""
+        request_payload = {
+            "json": {
+                "model": "test-vlm",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"},
+                            },
+                            {"type": "text", "text": "What is in this image?"},
+                        ],
+                    }
+                ],
+            },
+        }
+        result = await client.render_chat_completion(request_payload)
+
+        assert result["request_id"] == "chatcmpl-mock-0"
+        assert result["token_ids"] == list(range(110))
+        assert result["sampling_params"] == {"temperature": 0.7, "max_tokens": 100}
+        assert result["model"] == "test-vlm"
+        assert result["stream"] is False
+        assert result["stream_options"] is None
+        assert result["cache_salt"] is None
+        assert result["priority"] == 0
+        assert result["kv_transfer_params"] is None
+
+        assert result["features"] == {
+            "mm_hashes": {"image": ["hash-0"]},
+            "mm_placeholders": {"image": [{"offset": 4, "length": 100}]},
+            "kwargs_data": {"image": ["mock-encoded-tensor-0"]},
+        }
+
+
+class TestMultiModalGeneration:
+    """Test that mm_features are correctly forwarded through generate()."""
+
+    @pytest.mark.asyncio
+    async def test_generate_with_mm_features(self, client, mock_servers):
+        """Passing mm_features in InferenceEngineInput sends features in the HTTP payload."""
+        mm_features = {
+            "mm_hashes": {"image": ["abc123hash"]},
+            "mm_placeholders": {"image": [{"offset": 0, "length": 10}]},
+        }
+        input_batch = {
+            "prompt_token_ids": [[1, 2, 3]],
+            "sampling_params": {"max_tokens": 50},
+            "mm_features": [mm_features],
+        }
+        result = await client.generate(input_batch)
+
+        assert len(result["responses"]) == 1
+        assert len(result["response_ids"]) == 1
+        assert result["stop_reasons"][0] == "stop"
+
+        async with httpx.AsyncClient() as http:
+            resp = await http.get(f"{mock_servers['proxy_url']}/test/last_generate_features")
+            captured = resp.json()
+        assert captured["features"] == mm_features
+
+
+class TestContextManager:
+    """Test async context manager."""
+
+    @pytest.mark.asyncio
+    async def test_async_context_manager(self, mock_servers):
+        """Test using client as async context manager."""
+
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+        )
+
+        async with client:
+            result = await client.resume()
+            assert len(result) == 2
+
+        # Session should be closed after exiting context
+        gen_client = client._generate_client
+        assert gen_client is None or all(session.closed for session in gen_client._sessions.values())
+
+
+class TestPerLoopSessions:
+    """HTTP sessions are bound to the event loop that created them."""
+
+    def test_sessions_are_isolated_per_loop(self):
+        client = RemoteInferenceClient(
+            proxy_url="http://localhost:1",
+            server_urls=["http://localhost:1"],
+            data_parallel_size=1,
+        )
+        # A persistent loop on its own thread, like the Tinker engine's continuous sampler.
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+
+        def on_persistent(coro):
+            return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=5)
+
+        try:
+            persistent = on_persistent(client._get_session())
+            # Sessions now live on the extracted generate client.
+            sessions = client._generate_client._sessions
+
+            # A transient loop (asyncio.run) gets its own session and leaves the persistent one open.
+            transient = asyncio.run(client._get_session())
+            assert transient is not persistent
+            assert not persistent.closed
+
+            # The persistent loop keeps reusing its session; the closed loop's entry is evicted.
+            assert on_persistent(client._get_session()) is persistent
+            assert list(sessions) == [loop]
+
+            # aclose() on the persistent loop closes only that loop's session.
+            on_persistent(client.aclose())
+            assert persistent.closed
+            assert sessions == {}
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            loop.close()
+
+
+async def _get_lora_registries(server_urls: List[str]) -> List[Dict[str, str]]:
+    """Helper: read the per-server LoRA registries from each mock server."""
+    registries: List[Dict[str, str]] = []
+    async with httpx.AsyncClient() as http:
+        for url in server_urls:
+            resp = await http.get(f"{url}/test/lora_registry")
+            registries.append(resp.json()["registry"])
+    return registries
+
+
+async def _get_last_models(server_urls: List[str]) -> List[Dict[str, Optional[str]]]:
+    """Helper: read the last per-method ``model`` field captured by each mock."""
+    last: List[Dict[str, Optional[str]]] = []
+    async with httpx.AsyncClient() as http:
+        for url in server_urls:
+            resp = await http.get(f"{url}/test/last_models")
+            last.append(resp.json())
+    return last
+
+
+class TestLoRAControlPlane:
+    """Test load_lora_adapter / unload_lora_adapter fan-out and bookkeeping."""
+
+    @pytest.mark.asyncio
+    async def test_load_lora_adapter_fans_out(self, client, mock_servers):
+        result = await client.load_lora_adapter("lora-A", "/tmp/path/lora-A")
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["status"] == 200
+            assert "Success" in response["body"]
+            assert "lora-A" in response["body"]
+
+        registries = await _get_lora_registries(mock_servers["server_urls"])
+        for reg in registries:
+            assert reg.get("lora-A") == "/tmp/path/lora-A"
+
+        await client.unload_lora_adapter("lora-A")
+
+    @pytest.mark.asyncio
+    async def test_load_lora_adapter_inplace_reload(self, client, mock_servers):
+        await client.load_lora_adapter("lora-X", "/tmp/path/v1")
+        await client.load_lora_adapter("lora-X", "/tmp/path/v2")
+
+        registries = await _get_lora_registries(mock_servers["server_urls"])
+        for reg in registries:
+            assert reg.get("lora-X") == "/tmp/path/v2"
+
+        await client.unload_lora_adapter("lora-X")
+
+    @pytest.mark.asyncio
+    async def test_unload_lora_adapter_fans_out(self, client, mock_servers):
+        await client.load_lora_adapter("lora-B", "/tmp/path/lora-B")
+
+        result = await client.unload_lora_adapter("lora-B")
+        assert len(result) == 2
+        for url, response in result.items():
+            assert response["status"] == 200
+            assert "Success" in response["body"]
+
+        registries = await _get_lora_registries(mock_servers["server_urls"])
+        for reg in registries:
+            assert "lora-B" not in reg
+
+    @pytest.mark.asyncio
+    async def test_unload_unknown_lora_raises(self, client, mock_servers):
+        # Server returns 404, surfaced as ClientResponseError via raise_for_status.
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await client.unload_lora_adapter("nonexistent-lora")
+        _assert_picklable_http_error(exc_info.value, status=404, message="Not Found")
+        registries = await _get_lora_registries(mock_servers["server_urls"])
+        for reg in registries:
+            assert "nonexistent-lora" not in reg
+
+    @pytest.mark.asyncio
+    async def test_default_lora_adapter_constant(self):
+        # Sanity check that the public constant has the documented value used
+        # across the SkyRL training paths.
+        assert SKYRL_LORA_ADAPTER_NAME == "skyrl-lora"
+
+
+class TestExplicitModelRequired:
+    """Data-plane ``model`` resolution rules.
+
+    Every data-plane method (``generate``, ``sample``, ``chat_completion``,
+    ``completion``, ``render_chat_completion``) follows the same rule:
+
+    - If a non-empty ``model`` is supplied (kwarg for ``generate``, body field
+      for the others) it is threaded through to the server as-is.
+    - If no model is supplied and LoRA is **not** in use
+      (``uses_lora_weight_sync=False``), the call falls back to
+      ``client.model_name``.
+    - If no model is supplied and LoRA **is** in use, the call raises
+      ``ValueError`` so requests don't silently target the base model.
+    """
+
+    @pytest.mark.asyncio
+    async def test_generate_threads_model_into_payload(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            data_parallel_size=1,
+        )
+        try:
+            input_batch = {
+                "prompt_token_ids": [[1, 2, 3]],
+                "sampling_params": {"max_tokens": 50},
+            }
+            await client.generate(input_batch, model="lora-explicit")
+            captured = await _get_last_models(mock_servers["server_urls"])
+            # generate routes through proxy_url == first server.
+            assert captured[0]["generate"] == "lora-explicit"
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_generate_defaults_to_base_when_no_lora(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            data_parallel_size=1,
+        )
+        try:
+            input_batch = {
+                "prompt_token_ids": [[1, 2, 3]],
+                "sampling_params": {"max_tokens": 50},
+            }
+            await client.generate(input_batch)
+            captured = await _get_last_models(mock_servers["server_urls"])
+            assert captured[0]["generate"] == "base-model"
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_generate_raises_when_lora_and_no_model(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            uses_lora_weight_sync=True,
+            data_parallel_size=1,
+        )
+        try:
+            input_batch = {
+                "prompt_token_ids": [[1, 2, 3]],
+                "sampling_params": {"max_tokens": 50},
+            }
+            with pytest.raises(ValueError, match="LoRA is enabled"):
+                await client.generate(input_batch)
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_uses_body_model(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {
+                "json": {
+                    "model": "lora-chat",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                "headers": {},
+            }
+            await client.chat_completion(request_payload)
+            captured = await _get_last_models(mock_servers["server_urls"])
+            assert captured[0]["chat"] == "lora-chat"
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_defaults_to_base_when_no_lora(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {
+                "json": {"messages": [{"role": "user", "content": "hi"}]},
+                "headers": {},
+            }
+            await client.chat_completion(request_payload)
+            captured = await _get_last_models(mock_servers["server_urls"])
+            assert captured[0]["chat"] == "base-model"
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_raises_when_lora_and_no_model(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            uses_lora_weight_sync=True,
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {
+                "json": {"messages": [{"role": "user", "content": "hi"}]},
+                "headers": {},
+            }
+            with pytest.raises(ValueError, match="LoRA is enabled"):
+                await client.chat_completion(request_payload)
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_completion_uses_body_model(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {
+                "json": {"model": "lora-completion", "prompt": "hello"},
+                "headers": {},
+            }
+            await client.completion(request_payload)
+            captured = await _get_last_models(mock_servers["server_urls"])
+            assert captured[0]["completion"] == "lora-completion"
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_completion_defaults_to_base_when_no_lora(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {"json": {"prompt": "hello"}, "headers": {}}
+            await client.completion(request_payload)
+            captured = await _get_last_models(mock_servers["server_urls"])
+            assert captured[0]["completion"] == "base-model"
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_completion_raises_when_lora_and_no_model(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            uses_lora_weight_sync=True,
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {"json": {"prompt": "hello"}, "headers": {}}
+            with pytest.raises(ValueError, match="LoRA is enabled"):
+                await client.completion(request_payload)
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_render_chat_completion_uses_body_model(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {
+                "json": {
+                    "model": "lora-render",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            }
+            result = await client.render_chat_completion(request_payload)
+            assert result["model"] == "lora-render"
+            captured = await _get_last_models(mock_servers["server_urls"])
+            assert captured[0]["render"] == "lora-render"
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_render_chat_completion_defaults_to_base_when_no_lora(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {"json": {"messages": [{"role": "user", "content": "hi"}]}}
+            result = await client.render_chat_completion(request_payload)
+            assert result["model"] == "base-model"
+            captured = await _get_last_models(mock_servers["server_urls"])
+            assert captured[0]["render"] == "base-model"
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_render_chat_completion_raises_when_lora_and_no_model(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            uses_lora_weight_sync=True,
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {"json": {"messages": [{"role": "user", "content": "hi"}]}}
+            with pytest.raises(ValueError, match="LoRA is enabled"):
+                await client.render_chat_completion(request_payload)
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_sample_uses_body_model(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {
+                "json": {
+                    "model": "lora-sample",
+                    "prompt": {"chunks": [{"tokens": [1, 2, 3]}]},
+                    "num_samples": 1,
+                    "sampling_params": {"temperature": 0.7, "max_tokens": 16},
+                }
+            }
+            await client.sample(request_payload)
+            captured = await _get_last_models(mock_servers["server_urls"])
+            assert captured[0]["generate"] == "lora-sample"
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_sample_defaults_to_base_when_no_lora(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {
+                "json": {
+                    "prompt": {"chunks": [{"tokens": [1, 2, 3]}]},
+                    "num_samples": 1,
+                    "sampling_params": {"temperature": 0.7, "max_tokens": 16},
+                }
+            }
+            await client.sample(request_payload)
+            captured = await _get_last_models(mock_servers["server_urls"])
+            assert captured[0]["generate"] == "base-model"
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_sample_raises_when_lora_and_no_model(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            model_name="base-model",
+            uses_lora_weight_sync=True,
+            data_parallel_size=1,
+        )
+        try:
+            request_payload = {
+                "json": {
+                    "prompt": {"chunks": [{"tokens": [1, 2, 3]}]},
+                    "num_samples": 1,
+                    "sampling_params": {"temperature": 0.7, "max_tokens": 16},
+                }
+            }
+            with pytest.raises(ValueError, match="LoRA is enabled"):
+                await client.sample(request_payload)
+        finally:
+            await client.teardown()
+
+
+class TestFinishSession:
+    """Tests for ``RemoteInferenceClient.finish_session`` (router notification).
+
+    ``finish_session`` runs on cleanup paths (trajectory completion, error, or
+    cancellation), so it must POST the session id to the router and never raise.
+    """
+
+    @pytest.mark.asyncio
+    async def test_posts_session_id(self, client, mock_servers):
+        """The session id is POSTed to the router's /finish_session endpoint."""
+        await client.finish_session("traj-finish-1")
+        await client.finish_session("traj-finish-2")
+
+        finished = httpx.get(f"{mock_servers['proxy_url']}/test/finished", timeout=2.0).json()["finished"]
+        assert "traj-finish-1" in finished
+        assert "traj-finish-2" in finished
+
+    @pytest.mark.asyncio
+    async def test_empty_session_id_is_noop(self, client, mock_servers):
+        """Empty or None session ids are not sent to the router."""
+        before = httpx.get(f"{mock_servers['proxy_url']}/test/finished", timeout=2.0).json()["finished"]
+        await client.finish_session("")
+        await client.finish_session(None)
+        after = httpx.get(f"{mock_servers['proxy_url']}/test/finished", timeout=2.0).json()["finished"]
+        assert before == after
+
+    @pytest.mark.asyncio
+    async def test_swallows_server_errors(self, error_router, mock_servers):
+        """A non-2xx router response does not raise (cleanup must not fail)."""
+        client = RemoteInferenceClient(
+            proxy_url=error_router,
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+        )
+        try:
+            await client.finish_session("traj-error")
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_swallows_connection_errors(self, mock_servers):
+        """An unreachable router does not raise."""
+        client = RemoteInferenceClient(
+            proxy_url=f"http://127.0.0.1:{get_open_port()}",
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+        )
+        try:
+            await client.finish_session("traj-unreachable")
+        finally:
+            await client.teardown()

@@ -1,0 +1,245 @@
+"""Verifies the training (forward/forward_backward) path does not bring up
+inference engines for text-only batches.
+
+``_to_training_batch`` only needs vLLM's render endpoint for image chunks;
+text-only batches — the SFT code path — must render locally so pure training
+runs never pay for inference-engine startup. No inference engines are brought
+up, so this runs on CPU. Requires the SkyRL-Train backend deps (ray/vllm). Run:
+  uv run --isolated --extra tinker --extra fsdp --with pytest pytest tests/tinker/skyrl_train/test_text_only_batch_no_inference.py
+"""
+
+from __future__ import annotations
+
+import base64
+from types import SimpleNamespace
+
+import pytest
+
+# Skip if skyrl_train_backend.py cannot be imported
+skyrl_train_backend = pytest.importorskip("skyrl.backends.skyrl_train_backend")
+
+from skyrl.tinker import types  # noqa: E402
+from skyrl.tinker.engine import prepare_model_pass_batch  # noqa: E402
+
+PAD_TOKEN_ID = 0
+
+
+class _EngineInitCalled(Exception):
+    """Sentinel raised by the stubbed _ensure_inference_engines."""
+
+
+class _RenderServerUsed(Exception):
+    """Sentinel raised by the stubbed _create_render_client."""
+
+
+def _fake_backend() -> SimpleNamespace:
+    def _ensure_inference_engines():
+        raise _EngineInitCalled
+
+    def _create_render_client():
+        raise _RenderServerUsed
+
+    return SimpleNamespace(
+        _renderer=None,
+        _inference_engine_client=None,
+        _cfg=None,
+        _tokenizer=SimpleNamespace(pad_token_id=PAD_TOKEN_ID),
+        _ensure_inference_engines=_ensure_inference_engines,
+        _create_render_client=_create_render_client,
+    )
+
+
+def _prepared_batch(model_input: types.ModelInput) -> types.PreparedModelPassBatch:
+    datum = types.Datum(
+        model_input=model_input,
+        loss_fn_inputs=types.LossFnInputs(
+            target_tokens=types.TensorData(data=[2, 3, 4]),
+            weights=types.TensorData(data=[1.0, 1.0, 1.0]),
+            advantages=types.TensorData(data=[]),
+            logprobs=types.TensorData(data=[]),
+        ),
+    )
+    requests = {"req1": ("model1", types.ForwardBackwardInput(data=[datum], loss_fn="cross_entropy"))}
+    return prepare_model_pass_batch(requests)
+
+
+def test_text_only_batch_skips_inference_engines():
+    """Text-only (SFT) batches render locally without touching inference engines."""
+    fake_self = _fake_backend()
+    prepared_batch = _prepared_batch(types.ModelInput(chunks=[types.EncodedTextChunk(tokens=[1, 2, 3])]))
+
+    batch = skyrl_train_backend.SkyRLTrainBackend._to_training_batch(fake_self, prepared_batch, role="policy")
+
+    # Full sequence = input tokens + last target token (SkyRL-Train shifts internally).
+    assert batch["sequences"].tolist() == [[1, 2, 3, 4]]
+    assert batch["attention_mask"].tolist() == [[1, 1, 1, 1]]
+    assert fake_self._renderer is None
+
+
+def _rl_prepared_batch_with_rollout_logprobs(
+    rollout_logprobs: list[list[float]] | None,
+) -> types.PreparedModelPassBatch:
+    data = []
+    for i in range(2):
+        kwargs = {}
+        if rollout_logprobs is not None:
+            kwargs["rollout_logprobs"] = types.TensorData(data=rollout_logprobs[i])
+        data.append(
+            types.Datum(
+                model_input=types.ModelInput(chunks=[types.EncodedTextChunk(tokens=[1, 2, 3])]),
+                loss_fn_inputs=types.LossFnInputs(
+                    target_tokens=types.TensorData(data=[2, 3, 4]),
+                    weights=types.TensorData(data=[1.0, 1.0, 1.0]),
+                    advantages=types.TensorData(data=[0.5, 0.5, 0.5]),
+                    logprobs=types.TensorData(data=[-1.0, -2.0, -3.0]),
+                    **kwargs,
+                ),
+            )
+        )
+    requests = {"req1": ("model1", types.ForwardBackwardInput(data=data, loss_fn="ppo"))}
+    return prepare_model_pass_batch(requests)
+
+
+def test_rollout_logprobs_mirror_sampling_logprobs_by_default():
+    """Without `rollout_logprobs`, the datum's `logprobs` fill both roles (ratio == 1)."""
+    batch = skyrl_train_backend.SkyRLTrainBackend._to_training_batch(
+        _fake_backend(), _rl_prepared_batch_with_rollout_logprobs(None), role="policy"
+    )
+    assert batch["action_log_probs"].tolist() == [[-1.0, -2.0, -3.0]] * 2
+    assert batch["rollout_logprobs"].tolist() == batch["action_log_probs"].tolist()
+
+
+def test_rollout_logprobs_are_used_when_provided():
+    """`rollout_logprobs` feeds off-policy correction; `logprobs` stays the PPO ratio denominator."""
+    batch = skyrl_train_backend.SkyRLTrainBackend._to_training_batch(
+        _fake_backend(),
+        _rl_prepared_batch_with_rollout_logprobs([[-1.5, -2.5, -3.5], [-1.0, -2.0, -3.0]]),
+        role="policy",
+    )
+    assert batch["action_log_probs"].tolist() == [[-1.0, -2.0, -3.0]] * 2
+    assert batch["rollout_logprobs"].tolist() == [[-1.5, -2.5, -3.5], [-1.0, -2.0, -3.0]]
+
+
+def test_rollout_logprobs_length_mismatch_rejected():
+    with pytest.raises(ValueError, match="rollout_logprobs"):
+        skyrl_train_backend.SkyRLTrainBackend._to_training_batch(
+            _fake_backend(), _rl_prepared_batch_with_rollout_logprobs([[-1.5, -2.5], [-1.0, -2.0, -3.0]]), role="policy"
+        )
+
+
+def test_mixed_batch_rejected():
+    """`rollout_logprobs` is all-or-nothing per batch: a datum that omits it while a batch-mate
+    provides it is a client inconsistency and fails loudly instead of silently losing correction."""
+    with pytest.raises(ValueError, match="every datum"):
+        skyrl_train_backend.SkyRLTrainBackend._to_training_batch(
+            _fake_backend(), _rl_prepared_batch_with_rollout_logprobs([[-1.5, -2.5, -3.5], []]), role="policy"
+        )
+
+
+def test_image_batch_uses_render_server_not_engines():
+    """Batches with image chunks go to the CPU render server, never the engines."""
+    fake_self = _fake_backend()
+    image_chunk = types.ImageChunk(data=base64.b64encode(b"not-a-real-png"), format="png")
+    prepared_batch = _prepared_batch(types.ModelInput(chunks=[types.EncodedTextChunk(tokens=[1, 2, 3]), image_chunk]))
+
+    with pytest.raises(_RenderServerUsed):
+        skyrl_train_backend.SkyRLTrainBackend._to_training_batch(fake_self, prepared_batch, role="policy")
+
+
+def test_render_client_prefers_engine_client_when_initialized():
+    """Once engines are up (RL), rendering reuses the engine client instead of a CPU server."""
+    engine_client = object()
+    fake_self = SimpleNamespace(
+        _inference_engines_initialized=True,
+        _inference_engine_client=engine_client,
+        _render_server=None,
+        _cfg=None,
+    )
+    client = skyrl_train_backend.SkyRLTrainBackend._create_render_client(fake_self)
+    assert client is engine_client
+    assert fake_self._render_server is None
+
+
+def test_engine_init_invalidates_cpu_render_state():
+    """When engines come up, the CPU-render-backed renderer and server are dropped
+    so the next image batch rebuilds against the engine client."""
+
+    class _RenderServerStub:
+        def __init__(self):
+            self.shutdown_called = False
+
+        def shutdown(self):
+            self.shutdown_called = True
+
+    render_server = _RenderServerStub()
+    fake_self = SimpleNamespace(
+        config=SimpleNamespace(runtime_role="combined"),
+        _inference_engines_initialized=False,
+        _inference_engine_client=object(),
+        _create_new_inference_client=lambda: None,
+        _dispatch=SimpleNamespace(
+            set_inference_engine_client=lambda client: None,
+            offload_for_sampling=lambda: None,
+        ),
+        init_weight_sync_state=lambda: None,
+        _renderer=object(),
+        _render_server=render_server,
+    )
+
+    skyrl_train_backend.SkyRLTrainBackend._ensure_inference_engines(fake_self)
+
+    assert fake_self._inference_engines_initialized
+    assert fake_self._renderer is None
+    assert render_server.shutdown_called
+    assert fake_self._render_server is None
+
+
+def test_extract_metrics_forwards_loss_metrics_family():
+    """Off-policy-correction metrics reach the client instead of being dropped.
+
+    Without this, a configured correction that never fires is indistinguishable
+    from one that works: `geo_sequence_mask_masked_ratio` is the only signal that
+    the geometric mask is actually rejecting sequences.
+    """
+    data = {
+        "final_loss": 1.0,
+        "loss_metrics/geo_sequence_mask_masked_ratio": 0.25,
+        "loss_metrics/geo_sequence_mask_over_high_ratio": 0.1,
+        "loss_metrics/is_ratio_max": 1.5,
+        "loss_metrics/is_ratio_min": 0.5,
+        "loss_metrics/clip_ratio": 0.03,
+    }
+
+    metrics = skyrl_train_backend.SkyRLTrainBackend._extract_metrics(_fake_backend(), data)
+
+    assert metrics["geo_sequence_mask_masked_ratio:mean"] == 0.25
+    assert metrics["geo_sequence_mask_over_high_ratio:mean"] == 0.1
+    assert metrics["clip_ratio:mean"] == 0.03
+    # `_max` / `_min` names pick the matching Tinker cross-chunk reduction.
+    assert metrics["is_ratio_max:max"] == 1.5
+    assert metrics["is_ratio_min:min"] == 0.5
+    # Non-loss_metrics keys keep their existing handling.
+    assert metrics["total_loss:sum"] == 1.0
+
+
+def test_extract_metrics_without_loss_metrics_is_unchanged():
+    """Batches with no loss-function metrics gain no extra keys."""
+    metrics = skyrl_train_backend.SkyRLTrainBackend._extract_metrics(
+        _fake_backend(), {"final_loss": 2.0, "policy_loss": 1.0}
+    )
+    assert metrics == {"total_loss:sum": 2.0, "loss:sum": 2.0, "pg_loss:sum": 1.0}
+
+
+@pytest.mark.parametrize("data", [{"loss": 2.5}, {"final_loss": 2.5}, {"loss": 2.5, "final_loss": 7.0}])
+def test_training_loss_supports_sdk_custom_loss(data):
+    metrics = skyrl_train_backend.SkyRLTrainBackend._extract_metrics(_fake_backend(), data)
+
+    # The SDK's custom-loss callback consumes this key before the optimizer step.
+    assert metrics.pop("loss:sum") == 2.5
+    assert metrics["total_loss:sum"] == 2.5
+
+
+def test_missing_training_loss_is_not_fabricated():
+    metrics = skyrl_train_backend.SkyRLTrainBackend._extract_metrics(_fake_backend(), {"policy_loss": 1.0})
+
+    assert metrics == {"pg_loss:sum": 1.0}

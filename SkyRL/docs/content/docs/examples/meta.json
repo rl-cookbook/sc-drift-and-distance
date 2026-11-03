@@ -1,0 +1,22 @@
+{
+  "title": "Examples",
+  "pages": [
+    "megatron",
+    "ppo",
+    "lora",
+    "amd",
+    "llm_as_a_judge",
+    "remote_server",
+    "training_backends",
+    "multi_turn_text2sql",
+    "search",
+    "geometry3k",
+    "visgym",
+    "quantized_rollouts",
+    "kimi_k2_int4_lora",
+    "spec_decode",
+    "mini_swe_agent",
+    "openenv",
+    "delta_weight_sync"
+  ]
+}

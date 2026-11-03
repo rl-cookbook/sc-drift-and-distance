@@ -1,0 +1,605 @@
+import logging
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import torch
+from jaxtyping import Bool, Float
+
+from skyrl.backends.skyrl_train.utils.packed_tensor import (
+    PackedTensor,
+    cu_seqlens_from_lengths,
+)
+from skyrl.backends.skyrl_train.utils.replay_utils import replay_padding_row
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    ROUTED_EXPERT_DTYPES,
+    RoutedExpertIndices,
+)
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_DTYPES,
+    SAMPLE_SUPPORT_LOGPROBS_DTYPES,
+    SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE,
+    SAMPLE_SUPPORT_TORCH_DTYPE,
+    SampleSupport,
+    SampleSupportLogprobs,
+)
+
+logger = logging.getLogger(__name__)
+
+# Torch counterparts of the canonical routed-expert dtypes.
+ROUTED_EXPERT_TORCH_DTYPES: Dict[np.dtype, torch.dtype] = {
+    np.dtype(np.uint8): torch.uint8,
+    np.dtype(np.int16): torch.int16,
+    np.dtype(np.int32): torch.int32,
+}
+
+
+def make_router_padding_mask(
+    attention_mask: torch.Tensor,
+    captured_route_lengths: List[int],
+) -> Bool[torch.Tensor, "batch seq_len"]:
+    """Build Megatron's router-only padding mask for a ragged vLLM route prefix.
+
+    vLLM records routes only for tokens it evaluates. The final training sequence can be
+    longer because the last sampled token has no subsequent decode forward, and SkyRL may
+    append a synthetic EOS. In multi-turn generation, observations join the captured prefix
+    only when a later turn evaluates them. Captured route rows therefore align with a prefix
+    of each real, left-padded sequence; the remaining suffix needs dummy routes.
+
+    This cannot be derived from the loss mask. A loss-masked prompt or observation may still
+    condition later trained actions and must replay its captured route. ``True`` marks only
+    left padding and tokens without a captured route so Megatron excludes their dummy routes
+    from router accounting.
+    """
+    if attention_mask.ndim != 2:
+        raise ValueError(f"Expected 2D attention_mask, got shape {attention_mask.shape}")
+    if len(captured_route_lengths) != attention_mask.shape[0]:
+        raise ValueError(
+            f"Expected one captured route length per trajectory, got {len(captured_route_lengths)} "
+            f"for batch size {attention_mask.shape[0]}"
+        )
+
+    captured = torch.as_tensor(captured_route_lengths, dtype=torch.long, device=attention_mask.device)
+    sequence_lengths = attention_mask.sum(dim=1, dtype=torch.long)
+    if torch.any(captured < 0) or torch.any(captured > sequence_lengths):
+        raise ValueError(
+            f"Captured route lengths must be within trajectory lengths, got "
+            f"captured={captured.tolist()} and lengths={sequence_lengths.tolist()}"
+        )
+
+    sequence_starts = attention_mask.shape[1] - sequence_lengths
+    positions = torch.arange(attention_mask.shape[1], device=attention_mask.device).unsqueeze(0)
+    captured_positions = (positions >= sequence_starts.unsqueeze(1)) & (
+        positions < (sequence_starts + captured).unsqueeze(1)
+    )
+    return ~captured_positions
+
+
+def _verify_inputs(
+    prompts: List[List[int]],
+    responses: List[List[int]],
+    rewards: Optional[List[Union[List[float], torch.Tensor]]],
+    loss_masks: List[List[int]],
+):
+    assert (
+        len(prompts) == len(responses) and len(prompts) > 0
+    ), "prompts and responses must have the same length and length must be greater than 0, got {} and {}".format(
+        len(prompts), len(responses)
+    )
+
+    if rewards is not None:
+        assert len(rewards) == len(prompts), "rewards must have the same length as prompts, got {} and {}".format(
+            len(rewards), len(prompts)
+        )
+    assert len(loss_masks) == len(prompts), "loss_masks must have the same length as prompt, got {} and {}".format(
+        len(loss_masks), len(prompts)
+    )
+
+
+def _reward_to_numpy(custom_reward: Union[List[float], torch.Tensor]) -> np.ndarray:
+    if isinstance(custom_reward, torch.Tensor):
+        reward_arr = custom_reward.detach().to(device="cpu", dtype=torch.float32).numpy()
+    else:
+        reward_arr = np.asarray(custom_reward, dtype=np.float32)
+
+    if reward_arr.ndim != 1:
+        raise ValueError(f"Expected a 1D per-token reward sequence, got shape {reward_arr.shape}")
+    return reward_arr
+
+
+def _fill_routed_expert_segment(
+    packed: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    rollout_expert_indices: List[RoutedExpertIndices],
+    sample_index: int,
+) -> None:
+    """Write one route segment, using distinct dummy routes for uncaptured trailing tokens."""
+    sample_indices = rollout_expert_indices[sample_index]
+    flags = sample_indices.flags
+    # torch.from_numpy refuses a non-writeable buffer, and decoded wire routes may be read-only.
+    if not flags.c_contiguous or not flags.writeable:
+        sample_indices = sample_indices.copy(order="C")
+    segment = packed[int(cu_seqlens[sample_index]) : int(cu_seqlens[sample_index + 1])]
+    captured = sample_indices.shape[0]
+    segment[:captured] = torch.from_numpy(sample_indices)
+    segment[captured:] = replay_padding_row(segment.shape[-1], dtype=packed.dtype)
+
+
+def _collate_rollout_expert_indices(
+    rollout_expert_indices: List[RoutedExpertIndices],
+    total_real: np.ndarray,
+) -> PackedTensor:
+    """Pack per-trajectory routes into one ``[sum(seq_len_i), layers, topk]`` buffer.
+
+    ``pack_routed_experts`` establishes the canonical dtype on the sending side, so entries are
+    validated rather than rescanned here. Every region of the buffer is written exactly once.
+    """
+    num_samples = len(rollout_expert_indices)
+    for sample_index, sample_indices in enumerate(rollout_expert_indices):
+        if not isinstance(sample_indices, np.ndarray):
+            raise TypeError(
+                f"rollout_expert_indices entries must be NumPy arrays, got {type(sample_indices).__name__} "
+                f"at sample {sample_index}"
+            )
+        if sample_indices.dtype not in ROUTED_EXPERT_DTYPES:
+            supported = ", ".join(
+                dtype.name for dtype in sorted(ROUTED_EXPERT_DTYPES, key=lambda dtype: dtype.itemsize)
+            )
+            raise ValueError(
+                f"rollout_expert_indices entries must use a canonical routed-expert dtype ({supported}), "
+                f"got {sample_indices.dtype} at sample {sample_index}"
+            )
+
+    first_shape = rollout_expert_indices[0].shape
+    if len(first_shape) != 3 or first_shape[0] == 0:
+        raise ValueError("rollout_expert_indices must contain routes for every trajectory")
+    num_layers, topk = first_shape[1:]
+    if topk < 1:
+        raise ValueError("rollout_expert_indices must contain at least one expert per layer")
+
+    # Validate serially so an invalid trajectory raises deterministically rather than from a worker.
+    for sample_index, sample_indices in enumerate(rollout_expert_indices):
+        if sample_indices.ndim != 3 or sample_indices.shape[1:] != (num_layers, topk):
+            raise ValueError(
+                "rollout_expert_indices entries must share [layers, topk], "
+                f"got shape {sample_indices.shape} at sample {sample_index}"
+            )
+        available = int(total_real[sample_index])
+        if sample_indices.shape[0] == 0 or sample_indices.shape[0] > available:
+            raise ValueError(
+                f"Trajectory {sample_index} has {sample_indices.shape[0]} route rows for {available} tokens"
+            )
+
+    batch_dtype = max((indices.dtype for indices in rollout_expert_indices), key=lambda dtype: dtype.itemsize)
+    if batch_dtype == np.dtype(np.int32):
+        logger.warning(
+            "Collating rollout_expert_indices as int32, which doubles this buffer. No supported expert count "
+            "needs more than int16, so the inference server is not compacting its routes."
+        )
+    cu_seqlens = cu_seqlens_from_lengths(total_real)
+    packed = torch.empty(
+        (int(total_real.sum()), num_layers, topk),
+        dtype=ROUTED_EXPERT_TORCH_DTYPES[batch_dtype],
+    )
+    for sample_index in range(num_samples):
+        _fill_routed_expert_segment(packed, cu_seqlens, rollout_expert_indices, sample_index)
+
+    return PackedTensor(packed, cu_seqlens)
+
+
+def _fill_sample_support_segment(
+    packed: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    rollout_sample_support: List[SampleSupport],
+    sample_index: int,
+) -> None:
+    """Write one trajectory's segment of the packed sample-support buffer."""
+    rows = rollout_sample_support[sample_index]
+    # torch.from_numpy refuses a non-writeable buffer, and decoded wire support may be read-only.
+    if not rows.flags.c_contiguous or not rows.flags.writeable:
+        rows = rows.copy(order="C")
+    packed[int(cu_seqlens[sample_index]) : int(cu_seqlens[sample_index + 1])] = torch.from_numpy(rows)
+
+
+def build_sample_support(
+    rollout_sample_support: List[SampleSupport],
+    response_lens: np.ndarray,
+) -> PackedTensor:
+    """Pack one response-token support segment per trajectory."""
+    num_samples = len(rollout_sample_support)
+    for sample_index, rows in enumerate(rollout_sample_support):
+        if not isinstance(rows, np.ndarray):
+            raise TypeError(
+                f"rollout_sample_support entries must be NumPy arrays, got {type(rows).__name__} "
+                f"at sample {sample_index}"
+            )
+        if rows.dtype not in SAMPLE_SUPPORT_DTYPES:
+            supported = ", ".join(dtype.name for dtype in SAMPLE_SUPPORT_DTYPES)
+            raise ValueError(
+                f"rollout_sample_support entries must use a canonical sample-support dtype ({supported}), "
+                f"got {rows.dtype} at sample {sample_index}"
+            )
+
+    first_shape = rollout_sample_support[0].shape
+    if len(first_shape) != 2 or first_shape[1] < 1:
+        raise ValueError(
+            f"rollout_sample_support must be [response_tokens, top_k] arrays, got shape {first_shape} at sample 0"
+        )
+    top_k = first_shape[1]
+
+    # Validate serially so an invalid trajectory raises deterministically rather than from a worker.
+    for sample_index, rows in enumerate(rollout_sample_support):
+        if rows.ndim != 2 or rows.shape[1] != top_k:
+            raise ValueError(
+                f"rollout_sample_support entries must share top_k {top_k}, "
+                f"got shape {rows.shape} at sample {sample_index}"
+            )
+        expected = int(response_lens[sample_index])
+        if rows.shape[0] != expected:
+            raise ValueError(
+                f"Trajectory {sample_index} has {rows.shape[0]} support rows for {expected} response tokens"
+            )
+
+    cu_seqlens = cu_seqlens_from_lengths(response_lens)
+    packed = torch.empty((int(response_lens.sum()), top_k), dtype=SAMPLE_SUPPORT_TORCH_DTYPE)
+    for sample_index in range(num_samples):
+        _fill_sample_support_segment(packed, cu_seqlens, rollout_sample_support, sample_index)
+    return PackedTensor(packed, cu_seqlens)
+
+
+def build_sample_support_logprobs(
+    rollout_sample_support_logprobs: List[SampleSupportLogprobs],
+    response_lens: np.ndarray,
+) -> PackedTensor:
+    """Pack one response-token segment of sampler support logprobs per trajectory.
+
+    Rows are float32 ``[response_tokens, top_k]``, aligned with ``build_sample_support``; ``-inf``
+    marks padding members.
+    """
+    num_samples = len(rollout_sample_support_logprobs)
+    for sample_index, rows in enumerate(rollout_sample_support_logprobs):
+        if not isinstance(rows, np.ndarray):
+            raise TypeError(
+                f"rollout_sample_support_logprobs entries must be NumPy arrays, got {type(rows).__name__} "
+                f"at sample {sample_index}"
+            )
+        if rows.dtype not in SAMPLE_SUPPORT_LOGPROBS_DTYPES:
+            supported = ", ".join(dtype.name for dtype in SAMPLE_SUPPORT_LOGPROBS_DTYPES)
+            raise ValueError(
+                "rollout_sample_support_logprobs entries must use a canonical sample-support logprobs dtype "
+                f"({supported}), got {rows.dtype} at sample {sample_index}"
+            )
+
+    first_shape = rollout_sample_support_logprobs[0].shape
+    if len(first_shape) != 2 or first_shape[1] < 1:
+        raise ValueError(
+            "rollout_sample_support_logprobs must be [response_tokens, top_k] arrays, "
+            f"got shape {first_shape} at sample 0"
+        )
+    top_k = first_shape[1]
+
+    for sample_index, rows in enumerate(rollout_sample_support_logprobs):
+        if rows.ndim != 2 or rows.shape[1] != top_k:
+            raise ValueError(
+                f"rollout_sample_support_logprobs entries must share top_k {top_k}, "
+                f"got shape {rows.shape} at sample {sample_index}"
+            )
+        expected = int(response_lens[sample_index])
+        if rows.shape[0] != expected:
+            raise ValueError(
+                f"Trajectory {sample_index} has {rows.shape[0]} support logprob rows for {expected} response tokens"
+            )
+
+    cu_seqlens = cu_seqlens_from_lengths(response_lens)
+    packed = torch.empty((int(response_lens.sum()), top_k), dtype=SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE)
+    for sample_index in range(num_samples):
+        _fill_sample_support_segment(packed, cu_seqlens, rollout_sample_support_logprobs, sample_index)
+    return PackedTensor(packed, cu_seqlens)
+
+
+def convert_prompts_responses_to_batch_tensors(
+    pad_token_id: int,
+    prompts: List[List[int]],
+    responses: List[List[int]],
+    rewards: List[Union[List[float], torch.Tensor]],
+    loss_masks: List[List[int]],
+    logprobs: Optional[List[List[float]]] = None,
+    rollout_expert_indices: Optional[List[RoutedExpertIndices]] = None,
+    rollout_sample_support: Optional[List[SampleSupport]] = None,
+    max_seq_len: Optional[int] = None,
+    rollout_sample_support_logprobs: Optional[List[SampleSupportLogprobs]] = None,
+) -> Tuple[
+    Float[torch.Tensor, "batch seq_len"],
+    Float[torch.Tensor, "batch seq_len"],
+    Float[torch.Tensor, "batch response_len"],
+    Float[torch.Tensor, "batch response_len"],
+    Float[torch.Tensor, "batch response_len"],
+    Optional[Float[torch.Tensor, "batch response_len"]],
+    Optional[PackedTensor],
+    Optional[PackedTensor],
+    Optional[PackedTensor],
+]:
+    """
+    Convert prompts and responses to batch tensors for training.
+
+    Each sequence is laid out as a single left-padded block:
+
+    | [PAD]  [PAD]  prompt prompt prompt respon respon |
+    | [PAD]  prompt prompt prompt respon respon respon |
+    | prompt prompt prompt respon respon respon respon |
+                          |<---- max_response_len ---->|
+
+    The padded sequence length is ``max(prompt_len_i + response_len_i)``.
+    This way, the max padded sequence length is ``max_seq_len``.
+
+    So the attention_mask is:
+    | 0       0       1       1       1       1       1 |
+    | 0       1       1       1       1       1       1 |
+    | 1       1       1       1       1       1       1 |
+
+    This makes the response-level tensors (response_mask, rewards, loss_masks, logprobs):
+    | prompt prompt respon respon |
+    | prompt respon respon respon |
+    | respon respon respon respon |
+
+    So the response_mask is:
+    | 0       0       1      1    |
+    | 0       1       1      1    |
+    | 1       1       1      1    |
+
+    attention_mask is 1 for all real tokens, 0 for padding.
+    response_mask_i is 1 for the last ``response_len_i`` positions, 0 for padding.
+
+    Response-level tensors are **right-aligned** within ``(batch, max_response_len)``: non-padded
+    values occupy the last ``response_len_i`` positions, with leading zeros. This matches the model
+    forward pass which extracts ``log_probs[:, -num_actions-1:-1]`` —- response tokens are always at
+    the end of the sequence, so their logprobs are right-aligned in the slice.
+
+    Assumes that the responses already contain an eos token at index -1.
+
+    Args:
+        pad_token_id: Token id used to left-pad ``sequences``
+        prompts: List of tokenized prompts
+        responses: List of tokenized responses
+        rewards: List of rewards for each response (lists or 1D tensors)
+        loss_masks: List of loss masks for each response
+        logprobs: List of rollout log probs for each response
+        max_seq_len: Optional. If provided and ``max(prompt_i + response_i)``
+            exceeds it, a warning is logged (no truncation is performed).
+
+    Returns:
+        sequences: ``(batch, max_total)`` where ``max_total = max(prompt_i + response_i)``.
+        attention_mask: ``(batch, max_total)``
+        response_mask: ``(batch, max_response)`` — right-aligned response indicator.
+        rewards: ``(batch, max_response)`` — right-aligned.
+        loss_masks: ``(batch, max_response)`` — right-aligned.
+        logprobs: ``(batch, max_response)`` — right-aligned, or ``None``.
+        rollout_expert_indices: ``PackedTensor`` whose values are
+            ``(sum(prompt_i + response_i), layers, topk)`` in canonical batch order, with
+            ``cu_seqlens`` naming each trajectory's segment, or ``None``.
+        rollout_sample_support: ``PackedTensor`` whose values are
+            ``(sum(response_i), top_k)`` in canonical batch order, with ``cu_seqlens`` naming
+            each trajectory's segment, or ``None``.
+        rollout_sample_support_logprobs: ``PackedTensor`` of float32 sampler logprobs with the same
+            layout as ``rollout_sample_support`` (``-inf`` on padding members), or ``None``.
+    """
+    _verify_inputs(prompts, responses, rewards, loss_masks)
+
+    prompt_token_lens = [len(p) for p in prompts]
+    response_token_lens = [len(r) for r in responses]
+
+    max_response = max(response_token_lens)
+    # Pad to the tightest bound: max per-sample total.
+    max_total = max(p + r for p, r in zip(prompt_token_lens, response_token_lens))
+
+    if max_seq_len is not None and max_total > max_seq_len:
+        logger.warning(
+            f"Max sequence length in batch ({max_total}) exceeds max_seq_len ({max_seq_len}). "
+            f"No truncation is performed; consider checking generator settings."
+        )
+
+    num_samples = len(prompts)
+
+    # Fill NumPy buffers by slice, then convert once.
+    prompt_lens = np.asarray(prompt_token_lens, dtype=np.int64)
+    response_lens = np.asarray(response_token_lens, dtype=np.int64)
+    total_real = prompt_lens + response_lens  # (num_samples,)
+    pad_lens = max_total - total_real  # left-pad width per sample
+
+    # Left-pad each prompt+response row.
+    sequences_np = np.full((num_samples, max_total), pad_token_id, dtype=np.int64)
+    for i in range(num_samples):
+        start = int(pad_lens[i])
+        p_len = int(prompt_lens[i])
+        sequences_np[i, start : start + p_len] = prompts[i]
+        sequences_np[i, start + p_len :] = responses[i]
+
+    # Real tokens occupy the trailing total_real positions.
+    col_total = np.arange(max_total, dtype=np.int64)
+    attention_mask_np = (col_total[None, :] >= pad_lens[:, None]).astype(np.int64)
+
+    # Response tokens occupy the trailing response_len positions.
+    col_resp = np.arange(max_response, dtype=np.int64)
+    resp_pad = max_response - response_lens
+    response_mask_np = (col_resp[None, :] >= resp_pad[:, None]).astype(np.int64)
+
+    sequences = torch.from_numpy(sequences_np)
+    attention_mask = torch.from_numpy(attention_mask_np)
+    response_mask = torch.from_numpy(response_mask_np)
+
+    # Response-level tensors are right-aligned to match the model output.
+    ret_loss_masks_np = np.zeros((num_samples, max_response), dtype=np.float32)
+    for i, lm in enumerate(loss_masks):
+        ret_loss_masks_np[i, max_response - len(lm) :] = lm
+
+    # Tensor rewards need explicit CPU/detach handling before NumPy packing.
+    ret_rewards_np = np.zeros((num_samples, max_response), dtype=np.float32)
+    for i, custom_reward in enumerate(rewards):
+        reward_arr = _reward_to_numpy(custom_reward)
+        ret_rewards_np[i, max_response - reward_arr.shape[0] :] = reward_arr
+
+    ret_loss_masks = torch.from_numpy(ret_loss_masks_np)
+    ret_rewards = torch.from_numpy(ret_rewards_np)
+
+    # Rollout logprobs are right-aligned like rewards and loss masks.
+    logprobs_tensor = None
+    if logprobs:
+        logprobs_np = np.zeros((num_samples, max_response), dtype=np.float32)
+        for i, sample_logprobs in enumerate(logprobs):
+            logprobs_np[i, max_response - len(sample_logprobs) :] = sample_logprobs
+        logprobs_tensor = torch.from_numpy(logprobs_np)
+
+    rollout_expert_indices_tensor = None
+    if rollout_expert_indices is not None:
+        num_samples = len(prompts)
+        if not isinstance(rollout_expert_indices, list):
+            raise TypeError("rollout_expert_indices must be a list of NumPy arrays")
+        if len(rollout_expert_indices) != num_samples:
+            raise ValueError("rollout_expert_indices must contain routes for every trajectory")
+
+        rollout_expert_indices_tensor = _collate_rollout_expert_indices(rollout_expert_indices, total_real)
+
+    sample_support_tensor = None
+    if rollout_sample_support is not None:
+        if not isinstance(rollout_sample_support, list):
+            raise TypeError("rollout_sample_support must be a list of NumPy arrays")
+        if len(rollout_sample_support) != num_samples:
+            raise ValueError("rollout_sample_support must contain support for every trajectory")
+
+        sample_support_tensor = build_sample_support(rollout_sample_support, response_lens)
+
+    sample_support_logprobs_tensor = None
+    if rollout_sample_support_logprobs is not None:
+        if rollout_sample_support is None:
+            raise ValueError("rollout_sample_support_logprobs requires rollout_sample_support")
+        if not isinstance(rollout_sample_support_logprobs, list):
+            raise TypeError("rollout_sample_support_logprobs must be a list of NumPy arrays")
+        if len(rollout_sample_support_logprobs) != num_samples:
+            raise ValueError("rollout_sample_support_logprobs must contain logprobs for every trajectory")
+
+        sample_support_logprobs_tensor = build_sample_support_logprobs(rollout_sample_support_logprobs, response_lens)
+        if sample_support_logprobs_tensor.values.shape != sample_support_tensor.values.shape:
+            raise ValueError(
+                f"rollout_sample_support_logprobs shape {tuple(sample_support_logprobs_tensor.values.shape)} does not "
+                f"match rollout_sample_support shape {tuple(sample_support_tensor.values.shape)}"
+            )
+
+    return (
+        sequences,
+        attention_mask,
+        response_mask,
+        ret_rewards,
+        ret_loss_masks,
+        logprobs_tensor,
+        rollout_expert_indices_tensor,
+        sample_support_tensor,
+        sample_support_logprobs_tensor,
+    )
+
+
+def compute_prompt_boundaries(uids: List[str]) -> List[Tuple[int, int]]:
+    """Compute per-prompt ``(start, end)`` slices from a flat ``uids`` list.
+
+    Args:
+        uids: List of uids, representing which prompt each sequence belongs to. Consecutive
+            equal entries belong to the same prompt (same assumption as
+            ``compute_prompt_mini_batch_boundaries``).
+
+    Returns:
+        List of (start, end) indices, one per prompt, in order. Works for both step-wise
+        (variable sequences per prompt) and non-step-wise training.
+
+    Example: uids = ["p0", "p0", "p1", "p1", "p1"] -> [(0, 2), (2, 5)]
+    """
+    boundaries: List[Tuple[int, int]] = []
+    seen_uids: set[str] = set()
+    start = 0
+    for i in range(1, len(uids)):
+        if uids[i] != uids[i - 1]:
+            assert (
+                uids[i] not in seen_uids
+            ), f"uid {uids[i]!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
+            seen_uids.add(uids[i - 1])
+            boundaries.append((start, i))
+            start = i
+    if uids:
+        boundaries.append((start, len(uids)))
+    return boundaries
+
+
+def compute_prompt_mini_batch_boundaries(
+    uids: List[str],
+    mini_batch_size: int,
+    train_batch_size: int,
+    is_stepwise: bool,
+    n_samples_per_prompt: int,
+) -> List[Tuple[int, int]]:
+    """Compute mini-batch ``(start, end)`` slices from a flat ``uids`` list.
+
+    Args:
+        uids: List of uids, representing which prompt each sequence belongs to.
+        mini_batch_size: Number of prompts to include in each mini-batch. Same as training config's
+            config.trainer.policy_mini_batch_size or config.trainer.critic_mini_batch_size.
+        train_batch_size: Number of prompts in a training batch. For sanity check.
+        is_stepwise: Whether the training is step-wise. For sanity check.
+        n_samples_per_prompt: how many samples per prompt. For sanity check.
+    Returns:
+        List of (start, end) indices of the mini-batches. The length of the list is the number of
+        mini-batches, guaranteed to be `train_batch_size // mini_batch_size` regardless of whether
+        the training is step-wise or not.
+
+    Consecutive equal entries in ``uids`` belong to the same prompt. Each mini batch spans exactly
+    ``mini_batch_size`` prompts (the last may be smaller if the total prompt count is not divisible
+    in step-wise training). Works for both step-wise (variable sequences per prompt) and non-step-wise
+    (fixed ``n_samples_per_prompt`` sequences per prompt) training.
+
+    We assume uids are contiguous, i.e. all n_samples_per_prompt trajectories for a prompt, or all
+    per-step sequences for a trajectory, are contiguous.
+
+    Example A: normal non-step-wise training, with n_samples_per_prompt=2 and train_batch_size=4.
+    uids = ["p0", "p0", "p1", "p1", "p2", "p2", "p3", "p3"]
+    mini_batch_size = 2
+    prompt_end_indices = [2, 4, 6, 8]
+    boundaries = [(0, 4), (4, 8)]  # because each mini batch spans exactly 2 prompts, hence 4 sequences
+
+    Example B: step-wise training with n_samples_per_prompt = 2, and each trajectory can have 1-2 turns.
+    uids = ["p0", "p0", "p0", "p0", "p1", "p1", "p2", "p2", "p2", "p3", "p3"]
+    mini_batch_size = 2
+    prompt_end_indices = [4, 6, 9, 11]
+    boundaries = [(0, 6), (6, 11)]
+    """
+    # First compute the end indices of each prompt.
+    prompt_end_indices: List[int] = []
+    seen_uids: set[str] = set()
+    seen_uids.add(uids[0])
+    for i in range(1, len(uids)):
+        if uids[i] != uids[i - 1]:
+            assert (
+                uids[i] not in seen_uids
+            ), f"uid {uids[i]!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
+            seen_uids.add(uids[i])
+            prompt_end_indices.append(i)
+    prompt_end_indices.append(len(uids))
+
+    # seen_uids should equal to the number of prompts and equal to `train_batch_size`
+    num_prompts = len(prompt_end_indices)
+    assert num_prompts == train_batch_size and len(seen_uids) == train_batch_size
+    assert train_batch_size % mini_batch_size == 0
+
+    # Compute boundaries.
+    boundaries: List[Tuple[int, int]] = []
+    start_seq = 0
+    for i in range(0, num_prompts, mini_batch_size):
+        end_prompt_idx = i + mini_batch_size - 1  # i + mini_batch_size is next mini-batch's first prompt's end index
+        end_seq = prompt_end_indices[end_prompt_idx]
+        boundaries.append((start_seq, end_seq))
+        start_seq = end_seq
+    assert len(boundaries) == train_batch_size // mini_batch_size
+
+    # Assert that the mini-batch boundaries are uniform for non-step-wise training.
+    if not is_stepwise:
+        expected_num_seq_in_mini_batch = n_samples_per_prompt * mini_batch_size
+        for i, (start, end) in enumerate(boundaries):
+            assert start == i * expected_num_seq_in_mini_batch
+            assert end - start == expected_num_seq_in_mini_batch
+
+    return boundaries

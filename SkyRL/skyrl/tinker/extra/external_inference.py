@@ -1,0 +1,179 @@
+import asyncio
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import httpx
+from cloudpathlib import AnyPath
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from skyrl.backends.renderer import render_model_input
+from skyrl.backends.utils import convert_vllm_prompt_logprobs
+from skyrl.tinker import types
+from skyrl.tinker.config import EngineConfig
+from skyrl.tinker.db_models import FutureDB, RequestStatus
+from skyrl.utils.log import logger
+from skyrl.utils.storage import download_and_unpack
+
+if TYPE_CHECKING:
+    from skyrl.tinker.api import SampleRequest
+
+
+def _extract_checkpoint_sync(checkpoint_path: AnyPath, target_dir: Path) -> None:
+    """Extract a LoRA checkpoint to disk for vLLM to load.
+
+    This is a blocking operation (filesystem/network I/O) and should be called
+    via asyncio.to_thread() to avoid blocking the event loop.
+    """
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Extract the checkpoint if it doesn't already exist
+    if not target_dir.exists():
+        try:
+            with download_and_unpack(checkpoint_path) as extracted_path:
+                extracted_path.rename(target_dir)
+        except FileExistsError:
+            # This could happen if two processes try to download the file.
+            # In that case the other process won the race and created target_dir.
+            pass
+
+
+class ExternalInferenceClient:
+    """Client for calling external inference engines (e.g., vLLM)."""
+
+    # TODO: make `external_future_store` required and remove the FutureDB
+    # write-back path in `call_and_store_result` — every production
+    # construction (api.py lifespan) already passes a store.
+    def __init__(self, engine_config: EngineConfig, db_engine, external_future_store=None):
+        self.base_url = f"{engine_config.external_inference_url}/v1"
+        self.api_key = engine_config.external_inference_api_key
+        self.checkpoints_base = engine_config.checkpoints_base
+        self.lora_base_dir = engine_config.external_inference_lora_base
+        self.db_engine = db_engine
+        self.external_future_store = external_future_store
+
+    async def call_and_store_result(
+        self,
+        request_id: int,
+        sample_req,
+        model_id: str,
+        checkpoint_id: str,
+        *,
+        base_model: str | None = None,
+    ):
+        """Background task to call external engine and store result in database."""
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.base_url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=httpx.Timeout(300.0, connect=10.0),  # 5 minutes for inference, 10s for connect
+            ) as http_client:
+                result = await self._forward_to_engine(
+                    sample_req, model_id, checkpoint_id, http_client, base_model=base_model
+                )
+            status = RequestStatus.COMPLETED
+        except Exception as e:
+            logger.exception("External engine error")
+            result = types.ErrorResponse(error=str(e), status="failed")
+            status = RequestStatus.FAILED
+
+        if self.external_future_store is not None:
+            await self.external_future_store.complete(request_id, result, status)
+            return
+
+        # TODO: remove this FutureDB write-back once `external_future_store`
+        # is required (see __init__).
+        async with AsyncSession(self.db_engine) as session:
+            future = await session.get(FutureDB, request_id)
+            # `result_data` is a text column holding pre-serialized JSON.
+            future.result_data = result.model_dump_json()
+            future.status = status
+            future.completed_at = datetime.now(timezone.utc)
+            await session.commit()
+
+    async def _forward_to_engine(
+        self,
+        request: "SampleRequest",
+        model_id: str,
+        checkpoint_id: str,
+        http_client: httpx.AsyncClient,
+        *,
+        base_model: str | None = None,
+    ) -> types.SampleOutput:
+        """Forward request to vLLM with dynamic LoRA loading.
+
+        Extracts the checkpoint to the configured external_inference_lora_base and references it by a model name
+        that vLLM can dynamically load via the lora_filesystem_resolver plugin.
+
+        For base model sampling (no LoRA), the request is sent directly using the base model name.
+        """
+        model_input = request.prompt.to_types()
+        prompt_tokens = render_model_input([model_input])[0].prompt_ids
+
+        if base_model:
+            # Base model sampling: use the model name directly, no LoRA checkpoint needed
+            model_name = base_model
+        else:
+            # LoRA sampling: extract checkpoint and reference it by name for dynamic loading
+            model_name = f"{model_id}_{checkpoint_id}"
+            checkpoint_path = self.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+            target_dir = self.lora_base_dir / model_name
+
+            await asyncio.to_thread(_extract_checkpoint_sync, checkpoint_path, target_dir)
+
+        payload = {
+            "model": model_name,
+            "prompt": prompt_tokens,
+            "n": request.num_samples,
+            "seed": request.sampling_params.seed,
+            "max_tokens": request.sampling_params.max_tokens,
+            "temperature": request.sampling_params.temperature,
+            "top_p": request.sampling_params.top_p,
+            "top_k": request.sampling_params.top_k,
+            "logprobs": True,
+            "stream": False,
+            "return_token_ids": True,
+        }
+        # vLLM's `prompt_logprobs` is an int: 0 returns just the prompt tokens'
+        # own logprobs, k>0 also returns the top-k per position.
+        topk_prompt_logprobs = getattr(request, "topk_prompt_logprobs", 0) or 0
+        want_prompt_logprobs = bool(request.prompt_logprobs) or topk_prompt_logprobs > 0
+        if want_prompt_logprobs:
+            payload["prompt_logprobs"] = topk_prompt_logprobs
+
+        # Pass X-Session-ID for deterministic routing
+        headers = {}
+        session_id = types.make_routing_session_id(request.sampling_session_id, request.seq_id)
+        if session_id is not None:
+            headers["X-Session-ID"] = session_id
+
+        response = await http_client.post("/completions", json=payload, headers=headers)
+        response.raise_for_status()
+        result = response.json()
+
+        prompt_logprobs = None
+        topk = None
+        if want_prompt_logprobs:
+            # All `n` choices share one prompt, so vLLM repeats the same prompt
+            # logprobs on each choice; read them off the first.
+            raw = result["choices"][0].get("prompt_logprobs") if result["choices"] else None
+            if raw is None:
+                logger.warning("Requested prompt logprobs but vLLM /completions returned none")
+            prompt_logprobs, topk = convert_vllm_prompt_logprobs(prompt_tokens, raw, topk=topk_prompt_logprobs)
+
+        sequences = []
+        for choice in result["choices"]:
+            lp = choice["logprobs"]
+            sequences.append(
+                types.GeneratedSequence(
+                    tokens=choice["token_ids"],
+                    logprobs=lp["token_logprobs"],
+                    stop_reason=choice["finish_reason"],
+                )
+            )
+
+        return types.SampleOutput(
+            sequences=sequences,
+            prompt_logprobs=prompt_logprobs,
+            topk_prompt_logprobs=topk,
+        )

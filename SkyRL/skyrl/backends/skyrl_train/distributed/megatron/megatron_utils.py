@@ -1,0 +1,1002 @@
+# Utils ported from Verl
+# https://github.com/volcengine/verl/blob/e1603dc97f3c20c58feed1f5be34acd5c72a830c/verl/utils/megatron_utils.py#L4
+# https://github.com/volcengine/verl/blob/dfa3933ac44b545fca1f6a8519fd07394a2cde1c/verl/models/mcore/util.py
+# The original copyright is reproduced below:
+
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2023-2024 SGLang Team
+# Copyright 2025 ModelBest Inc. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+import re
+from typing import Any, Dict, Iterator, List, Optional, Union
+
+import torch
+import torch.nn as nn
+from loguru import logger
+from megatron.core import parallel_state as mpu
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.moe_utils import (
+    clear_aux_losses_tracker,
+    get_moe_layer_wise_logging_tracker,
+    reduce_aux_losses_tracker_across_ranks,
+)
+from megatron.core.utils import get_attr_wrapped_model, unwrap_model
+
+from skyrl.backends.skyrl_train.distributed.megatron.packing_utils import (
+    get_packed_seq_align_size,
+    get_unpacked_seq_align_size,
+)
+
+ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
+
+
+def make_batch_generator(batches, vpp_size):
+    """
+    Creates a batch generator suitable for Megatron pipeline parallelism,
+    handling virtual pipeline parallelism (VPP).
+
+    If VPP is used (vpp_size > 1), it duplicates the batch iterator for each
+    virtual pipeline stage. Otherwise, it returns a single iterator.
+
+    Args:
+        batches: An iterable (e.g., list) of micro-batches.
+        vpp_size (int): The virtual pipeline model parallel size.
+
+    Returns:
+        An iterator or a list of iterators over the micro-batches.
+    """
+    if vpp_size > 1:
+        # has vpp
+        batch_generator = [batches] * vpp_size  # number of vpp chunks
+        batch_generator = [iter(b) for b in batch_generator]
+    else:
+        # no vpp
+        batch_generator = iter(batches)
+    return batch_generator
+
+
+def print_model_size(model: nn.Module, name: str = None):
+    n_params, scale = get_model_size(model, scale="auto")
+    if name is None:
+        name = model.__class__.__name__
+    logger.info(f"{name} contains {n_params:.2f}{scale} parameters")
+
+
+def get_model_size(model: nn.Module, scale="auto"):
+    n_params = sum(p.numel() for p in model.parameters())
+
+    if scale == "auto":
+        if n_params > 1e9:
+            scale = "B"
+        elif n_params > 1e6:
+            scale = "M"
+        elif n_params > 1e3:
+            scale = "K"
+        else:
+            scale = ""
+
+    if scale == "B":
+        n_params = n_params / 1e9
+    elif scale == "M":
+        n_params = n_params / 1e6
+    elif scale == "K":
+        n_params = n_params / 1e3
+    elif scale == "":
+        pass
+    else:
+        raise NotImplementedError(f"Unknown scale {scale}")
+
+    return n_params, scale
+
+
+def get_moe_metrics(
+    loss_scale: float,
+    total_loss_dict: Optional[dict] = None,
+    per_layer_logging: bool = False,
+) -> dict[str, Any]:
+    """Returns Mixture of Experts (MoE) auxiliary-loss metrics.
+
+    This function reduces MoE auxiliary losses across ranks, aggregates them, and
+    returns a dictionary of metrics.
+
+    Args:
+        loss_scale: Scale factor to apply to each auxiliary loss (e.g., 1/num_microbatches).
+        total_loss_dict: If provided, accumulate means into this dict (by name).
+        per_layer_logging: If True, include per-layer values in the returned dict.
+
+    Returns:
+        dict[str, Any]: A flat dict of aggregated metrics. For each aux loss name,
+        the mean value is returned under the same key (e.g., "load_balancing_loss").
+        If per_layer_logging is True, per-layer values are returned under keys of the
+        form "moe/{name}_layer_{i}".
+    """
+    reduce_aux_losses_tracker_across_ranks()
+    tracker = get_moe_layer_wise_logging_tracker()
+
+    metrics: dict[str, Any] = {}
+    if len(tracker) > 0:
+        aux_losses = {k: v["values"].float() * loss_scale for k, v in tracker.items()}
+        for name, loss_list in aux_losses.items():
+            # Megatron-Core aggregates aux losses across layers and normalizes by number of MoE layers
+            num_layers = int(loss_list.numel()) if loss_list.numel() > 0 else 1
+            aggregated_value = loss_list.sum() / num_layers
+            metrics[name] = float(aggregated_value.item())
+            if total_loss_dict is not None:
+                if name not in total_loss_dict:
+                    total_loss_dict[name] = aggregated_value
+                else:
+                    total_loss_dict[name] += aggregated_value
+
+            if per_layer_logging:
+                for i, loss in enumerate(loss_list.tolist()):
+                    metrics[f"moe/{name}_layer_{i}"] = float(loss)
+
+    clear_aux_losses_tracker()
+    return metrics
+
+
+def _resolve_transformer_decoder(model: nn.Module) -> Optional[nn.Module]:
+    """Return the ``TransformerBlock`` holding the decoder layers, or None.
+
+    Text-only Megatron-Core models expose it as ``model.decoder``. Multimodal
+    models (``LLaVAModel`` and the per-architecture VLM classes derived from it)
+    nest the language tower one level down, as ``model.language_model.decoder``,
+    and have no ``decoder`` attribute of their own. Vision-only or embedding-only
+    stages have neither.
+    """
+    decoder = getattr(model, "decoder", None)
+    if decoder is not None:
+        return decoder
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None:
+        return getattr(language_model, "decoder", None)
+    return None
+
+
+def _iter_transformer_layer_modules(model: nn.Module, decoder: nn.Module) -> Iterator[nn.Module]:
+    """Yield every module under the decoder layers and, when present, the MTP layers.
+
+    Walking whole subtrees reaches transformer layers that ``HybridStack`` wraps in
+    ``HyperConnectionHybridLayer.layer`` and the layer each MTP depth holds as
+    ``MultiTokenPredictionLayer.mtp_model_layer``. The MTP block sits beside the
+    decoder, as ``mtp`` on the same text-only model or language tower.
+    """
+    yield from decoder.layers.modules()
+    language_model = model if getattr(model, "decoder", None) is decoder else getattr(model, "language_model", None)
+    mtp = getattr(language_model, "mtp", None)
+    if mtp is not None:
+        yield from mtp.layers.modules()
+
+
+def freeze_moe_router(model_or_models: Union[nn.Module, List[nn.Module]]):
+    models = model_or_models
+    if not isinstance(model_or_models, list):
+        models = [model_or_models]
+
+    froze_any = False
+    for model in models:
+        decoder = _resolve_transformer_decoder(model)
+        if decoder is None:
+            logger.warning(
+                f"freeze_moe_router: no transformer decoder found on {type(model).__name__}; "
+                "skipping this model chunk. Router params on it stay trainable."
+            )
+            continue
+        for layer in _iter_transformer_layer_modules(model, decoder):
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
+                if getattr(layer.mlp.router, "weight", None) is not None:
+                    layer.mlp.router.weight.requires_grad = False
+                    froze_any = True
+                if getattr(layer.mlp.router, "bias", None) is not None:
+                    layer.mlp.router.bias.requires_grad = False
+                    froze_any = True
+
+    if not froze_any:
+        logger.warning(
+            "freeze_moe_router: froze no router parameters. Either the model has no MoE "
+            "layers, or this rank holds only non-MoE pipeline stages."
+        )
+    # modified in-place
+    return model_or_models
+
+
+def _require_num_moe_experts(key: str, num_moe_experts: Optional[int]) -> int:
+    if num_moe_experts is None:
+        raise ValueError(
+            f"Shared-outer expert LoRA tensor {key!r} must be expanded to every expert, "
+            "but num_moe_experts was not provided"
+        )
+    return num_moe_experts
+
+
+def freeze_dsa_indexer(model_or_models: Union[nn.Module, List[nn.Module]]):
+    """Freeze the dynamic-sparse-attention indexer on every attention layer that has one.
+
+    The indexer scores keys and emits the top-k *indices* the sparse attention kernel
+    then gathers. When auxiliary indexer loss is disabled (dsa_indexer_loss_coeff=0),
+    these discrete indices provide no gradient to the indexer. Leaving it trainable
+    in that configuration is not merely wasteful: Megatron's
+    ``DistributedDataParallel`` buckets a parameter by ``requires_grad`` at
+    construction and, with ``overlap_grad_reduce``, asserts that every bucketed
+    parameter's backward hook fired before the bucket reduces.
+
+    Use this option for a fixed pretrained indexer. It removes the indexer from the
+    grad buffer and optimizer state; leave it disabled to train with auxiliary loss.
+    """
+    models = model_or_models
+    if not isinstance(model_or_models, list):
+        models = [model_or_models]
+
+    froze = 0
+    for model in models:
+        decoder = _resolve_transformer_decoder(model)
+        if decoder is None:
+            logger.warning(
+                f"freeze_dsa_indexer: no transformer decoder found on {type(model).__name__}; "
+                "skipping this model chunk. Indexer params on it stay trainable."
+            )
+            continue
+        for layer in _iter_transformer_layer_modules(model, decoder):
+            core_attention = getattr(getattr(layer, "self_attention", None), "core_attention", None)
+            indexer = getattr(core_attention, "indexer", None)
+            if indexer is None:
+                continue
+            for param in indexer.parameters():
+                if param.requires_grad:
+                    param.requires_grad = False
+                    froze += 1
+
+    if froze:
+        logger.info(f"freeze_dsa_indexer: froze {froze} indexer parameters")
+    else:
+        logger.warning(
+            "freeze_dsa_indexer: froze no indexer parameters. Either the model does not use "
+            "dynamic sparse attention, this rank holds only dense-attention pipeline stages, "
+            "or the indexer was already frozen."
+        )
+    # modified in-place
+    return model_or_models
+
+
+def _convert_moe_experts_lora_to_vllm(
+    adapter_state: Dict[str, "torch.Tensor"],
+    num_moe_experts: Optional[int] = None,
+) -> Dict[str, "torch.Tensor"]:
+    """Rewrite fused-MoE expert LoRA tensors into the layout vLLM expects.
+
+    Megatron-Bridge exports fused experts as 3D tensors keyed
+    ``...mlp.experts.gate_up_proj`` (w13) / ``...mlp.experts.down_proj`` (w2),
+    with ``lora_A=(E, rank, in)`` and ``lora_B=(E, out, rank)``. vLLM's 3D-MoE
+    loader (``FusedMoE3DWithLoRA`` / ``_stack_moe_lora_weights``) instead expects
+    the flat PEFT layout keyed ``...experts.base_layer`` (w13) / ``...experts``
+    (w2), with ``lora_A=(rank*E, in)`` and ``lora_B=(out, rank*E)``. This is the
+    exact inverse of vLLM's per-expert reshape. Non-expert tensors pass through.
+
+    Shared-outer grouped-expert LoRA (``experts_shared_outer_loras=True``) exports
+    the shared side (gate_up lora_A / down lora_B) as a ``(1, ...)`` tensor under
+    an expert-agnostic name. vLLM has no shared-expert LoRA contract, so the
+    shared side is expanded to all ``num_moe_experts`` experts (mathematically
+    identical since every expert applies the same matrix): for packed-HF models
+    it joins the flat-layout rewrite above; for per-expert-HF models (keys like
+    ``...experts.<idx>.gate_proj``) it is replicated into per-expert indexed keys.
+    """
+    uses_indexed_expert_keys = any(re.search(r"\.mlp\.experts\.\d+\.", key) for key in adapter_state)
+
+    converted: Dict[str, "torch.Tensor"] = {}
+    for key, tensor in adapter_state.items():
+        is_gate_up = ".mlp.experts.gate_up_proj." in key
+        is_down = ".mlp.experts.down_proj." in key
+        if (is_gate_up or is_down) and tensor.ndim == 3 and not uses_indexed_expert_keys:
+            if tensor.shape[0] == 1:
+                tensor = tensor.expand(_require_num_moe_experts(key, num_moe_experts), -1, -1)
+            if key.endswith(".lora_A.weight"):
+                # (E, rank, in) -> (rank*E [expert-major], in)
+                tensor = tensor.reshape(-1, tensor.shape[-1]).contiguous()
+            elif key.endswith(".lora_B.weight"):
+                # (E, out, rank) -> (out, rank*E [expert-minor])
+                tensor = tensor.permute(1, 2, 0).contiguous().reshape(tensor.shape[1], -1)
+            if is_gate_up:
+                key = key.replace(".mlp.experts.gate_up_proj.", ".mlp.experts.base_layer.")
+            else:
+                key = key.replace(".mlp.experts.down_proj.", ".mlp.experts.")
+            converted[key] = tensor
+            continue
+
+        shared_match = (
+            re.search(r"\.mlp\.experts\.(gate_proj|up_proj|down_proj)\.(lora_[AB])\.weight$", key)
+            if uses_indexed_expert_keys
+            else None
+        )
+        if shared_match is not None and tensor.ndim == 3 and tensor.shape[0] == 1:
+            # Per-expert-HF model: replicate the shared side into the indexed
+            # per-expert keys vLLM's PEFT loader parses.
+            insert_pos = key.rindex(".mlp.experts.") + len(".mlp.experts.")
+            for expert_idx in range(_require_num_moe_experts(key, num_moe_experts)):
+                converted[f"{key[:insert_pos]}{expert_idx}.{key[insert_pos:]}"] = tensor[0].clone()
+            continue
+
+        converted[key] = tensor
+    return converted
+
+
+def gdn_in_proj_lora_is_safe(bridge) -> bool:
+    """Whether LoRA on GatedDeltaNet ``in_proj`` can round-trip through weight sync.
+
+    False for models whose bridge maps ``in_proj`` to two fused HF tensors
+    (``in_proj_qkvz``/``in_proj_ba``, e.g. Qwen3-Next): peft_bridge has no
+    fused-adapter split for that layout, so a merged export fails on a shape
+    mismatch and an unmerged export silently drops the ``in_proj_ba`` half.
+    True for the separate ``in_proj_qkv/z/b/a`` layout (e.g. Qwen3.5) and for
+    models without GDN layers (where ``in_proj`` matches nothing).
+    """
+    # `_model_bridge` hands each fresh bridge only the raw HF config; some
+    # bridges' `mapping_registry` inspect the checkpoint through
+    # `hf_pretrained.state` (GLM-4.5's fused-expert probe), so install the
+    # AutoBridge's weights-backed `hf_pretrained` first.
+    model_bridge = bridge._model_bridge
+    model_bridge.hf_pretrained = bridge.hf_pretrained
+    mapping = model_bridge.mapping_registry().megatron_to_hf_lookup(
+        # Layer 0 stands in for the wildcard in the bridge's mapping patterns.
+        "decoder.layers.0.self_attention.in_proj.weight"
+    )
+    if mapping is None:
+        return True
+    return isinstance(mapping.hf_param, dict) and set(mapping.hf_param) == {"qkv", "z", "b", "a"}
+
+
+@torch.no_grad()
+def offload_megatron_grads_to_cpu(models):
+    for model_chunk in models:
+        if isinstance(model_chunk, DDP):
+            # use megatron DDP built in function to offload grads to cpu
+            # https://github.com/NVIDIA/Megatron-LM/blob/core_v0.16.0/megatron/core/distributed/distributed_data_parallel.py#L575
+            model_chunk.offload_grad_buffers(synchronize=False, empty_cache=False)
+        else:
+            for _, param in model_chunk.named_parameters():
+                if param.grad is not None:
+                    param.grad = param.grad.to("cpu", non_blocking=True)
+
+
+@torch.no_grad()
+def load_megatron_grads_to_gpu(models):
+    for model_chunk in models:
+        if isinstance(model_chunk, DDP):
+            model_chunk.restore_grad_buffers(synchronize=False)
+        else:
+            for _, param in model_chunk.named_parameters():
+                if param.grad is not None:
+                    param.grad = param.grad.to(torch.cuda.current_device(), non_blocking=True)
+
+
+# Frozen (requires_grad=False, non-adapter) weights are immutable for the
+# whole run, so their CPU offload copies can live in file-backed mmap storage
+# instead of RAM: the pages are then *clean page cache* the kernel can evict
+# and re-read freely, instead of ~1.3TB/node of anonymous/pinned memory that
+# competes with the vLLM engines for physical RAM (the source of repeated
+# NUMA OOM kills and compress-swap stalls on TB-scale colocated models).
+# Each param's file is written on first offload, mapped, and immediately
+# unlinked; the mapping keeps the inode alive until the process exits, and
+# sleep/wake cycles reuse the live mapping via ``param._offload_cpu_data``.
+# Set SKYRL_FROZEN_OFFLOAD_DIR=0 (or empty) to restore pinned-RAM offload.
+_FROZEN_OFFLOAD_DIR = os.environ.get("SKYRL_FROZEN_OFFLOAD_DIR", "/data/skyrl/frozen-offload")
+
+
+def _frozen_offload_enabled() -> bool:
+    return bool(_FROZEN_OFFLOAD_DIR) and _FROZEN_OFFLOAD_DIR != "0"
+
+
+# Set after the first file-offload failure: later params skip straight to the
+# pinned-RAM fallback instead of retrying the filesystem and re-logging the
+# same warning for every frozen param.
+_frozen_offload_failed = False
+
+
+def _frozen_offload_file(name: str) -> str:
+    import hashlib
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    # The name hash is cosmetic (the file lives only until it is mapped); the
+    # pid suffix keeps concurrent processes on one node from sharing a path.
+    key = hashlib.sha1(name.encode()).hexdigest()[:20]
+    rank_dir = os.path.join(_FROZEN_OFFLOAD_DIR, f"rank{rank}")
+    os.makedirs(rank_dir, exist_ok=True)
+    return os.path.join(rank_dir, f"{key}-{os.getpid()}.bin")
+
+
+def _offload_frozen_param_to_file(name: str, param) -> bool:
+    """Move a frozen param's data to a file-backed mmap CPU tensor.
+
+    The backing file is unlinked as soon as it is mapped: the mapping pins the
+    inode (whose pages stay clean, evictable page cache) until the process
+    exits, at which point the kernel reclaims the space. No other chunk,
+    process, or run can ever open the file, and no cleanup is needed — even on
+    SIGKILL. The space shows up in ``df`` but not in directory listings.
+
+    Returns True on success; False to let the caller fall back to pinned RAM.
+    """
+    global _frozen_offload_failed
+    if _frozen_offload_failed:
+        return False
+    path = None
+    try:
+        data = param.data.detach()
+        nbytes = data.numel() * data.element_size()
+        path = _frozen_offload_file(name)
+        with open(path, "wb") as f:
+            # The numpy array shares the CPU tensor's memory and write() takes
+            # any buffer-protocol object, so no second full-size copy is made
+            # (unlike .tobytes()).
+            f.write(data.contiguous().view(torch.uint8).flatten().cpu().numpy())
+        try:
+            mapped = (
+                torch.from_file(path, shared=False, size=nbytes, dtype=torch.uint8).view(data.dtype).view(data.shape)
+            )
+        finally:
+            os.unlink(path)
+            path = None
+        param._offload_cpu_data = mapped
+        return True
+    except (OSError, RuntimeError) as exc:
+        if path is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        _frozen_offload_failed = True
+        logging.getLogger(__name__).warning(
+            "file-backed frozen offload failed for %s (%s); falling back to pinned RAM for all frozen params",
+            name,
+            exc,
+        )
+        return False
+
+
+@torch.no_grad()
+def offload_megatron_model_to_cpu(models, is_lora: bool = False):
+    """
+    In megatron, the model and optimizer storage are:
+    - bf16 parameter data chunked in model parallel group
+    - fp32 grad chunked in model parallel group
+    - fp32 main_parameter chunked in model and dp group
+    - fp32 optimizer state chunked in model and dp group
+
+    ``is_lora``: the run trains LoRA adapters only (base weights frozen).
+    """
+    for model_chunk in models:
+        if isinstance(model_chunk, DDP):
+            # LoRA: Megatron's fused param/grad buffers only hold grad-requiring
+            # params, so here they contain nothing but the adapters (a few GB) —
+            # keep them resident. The adapter-only weight sync exports straight
+            # from these GPU tensors, so the TB-scale frozen masters never need
+            # to round-trip through the GPU just to sync a rank-32 adapter.
+            if not is_lora:
+                for buffer in model_chunk.buffers + model_chunk.expert_parallel_buffers:
+                    # use megatron buffer built in function to offload to cpu
+                    # https://github.com/NVIDIA/Megatron-LM/blob/core_v0.16.0/megatron/core/distributed/param_and_grad_buffer.py#L964
+                    buffer.offload_to_cpu(move_params=True, move_grads=False)
+
+            # LoRA-aware offloading: offload non-lora base weights that live
+            # outside the fused Megatron buffers (e.g. HF/bridge "to_wrap" weights).
+            # Frozen weights are immutable, so prefer file-backed mmap copies
+            # (clean, evictable page cache) over pinned RAM; see
+            # _offload_frozen_param_to_file.
+            use_file_offload = _frozen_offload_enabled()
+            for name, param in model_chunk.named_parameters():
+                if (
+                    param.is_cuda
+                    and not param.requires_grad
+                    and "adapter" not in name
+                    and param.data.storage().size() > 0
+                ):
+                    if hasattr(param, "_offload_cpu_data") and param._offload_cpu_data is not None:
+                        # Frozen data never changes: the existing CPU copy
+                        # (file-backed or pinned) is still valid; just free
+                        # the GPU side again.
+                        pass
+                    elif not (use_file_offload and _offload_frozen_param_to_file(name, param)):
+                        cpu_tensor = param.data.detach().cpu().pin_memory()
+                        param._offload_cpu_data = cpu_tensor
+                    param._offload_cuda_numel = param.data.numel()
+                    param.data = torch.empty(0, dtype=param.data.dtype, device=param.data.device)
+        else:
+            for _, param in model_chunk.named_parameters():
+                param.data = param.data.to("cpu", non_blocking=True)
+
+
+@torch.no_grad()
+def load_megatron_model_to_gpu(models, is_lora: bool = False):
+    for model_chunk in models:
+        if isinstance(model_chunk, DDP):
+            # LoRA buffers never offload (see offload_megatron_model_to_cpu).
+            if not is_lora:
+                for buffer in model_chunk.buffers + model_chunk.expert_parallel_buffers:
+                    buffer.reload_from_cpu(move_params=True, move_grads=False)
+
+            # Restore any LoRA-frozen base weights that were offloaded above.
+            device_id = torch.cuda.current_device()
+            for name, param in model_chunk.named_parameters():
+                if hasattr(param, "_offload_cpu_data") and param.data.storage().size() == 0:
+                    restored = param._offload_cpu_data.to(device_id, non_blocking=True)
+                    param.data = restored
+        else:
+            device_id = torch.cuda.current_device()
+            for _, param in model_chunk.named_parameters():
+                param.data = param.data.to(device_id, non_blocking=True)
+
+
+@torch.no_grad()
+def offload_megatron_copy_params(optimizers):
+    """
+    Offload optimizer parameters to CPU. Supports both Megatron optimizers
+    and `ChainedOptimizer`, which wraps a list of underlying optimizers.
+
+    Args:
+        optimizers: The optimizer or ChainedOptimizer instance.
+    """
+
+    def _iter_opts(opt):
+        if isinstance(opt, ChainedOptimizer):
+            return opt.chained_optimizers
+        return [opt]
+
+    def offload_tensor_to_cpu(tensor):
+        if tensor is None:
+            return
+        tensor.data = tensor.data.to("cpu", non_blocking=True)
+
+    def offload_group_to_cpu(group):
+        if group is None:
+            return
+
+        if isinstance(group, list):
+            for param_group in group:
+                if isinstance(param_group, list):
+                    for param in param_group:
+                        offload_tensor_to_cpu(param)
+                else:
+                    offload_tensor_to_cpu(param_group)
+        else:
+            offload_tensor_to_cpu(group)
+
+    # Offload all parameter groups to CPU for each underlying optimizer
+
+    for _opt in _iter_opts(optimizers):
+        if hasattr(_opt, "shard_fp32_from_float16_groups"):
+            offload_group_to_cpu(_opt.shard_fp32_from_float16_groups)
+
+
+@torch.no_grad()
+def load_megatron_copy_params(optimizers):
+    """
+    Load optimizer parameters back to GPU. Handles ChainedOptimizer.
+
+    Args:
+        optimizers: Optimizer or ChainedOptimizer instance.
+    """
+
+    def _iter_opts(opt):
+        if isinstance(opt, ChainedOptimizer):
+            return opt.chained_optimizers
+        return [opt]
+
+    def load_tensor_to_gpu(tensor):
+        if tensor is None:
+            return
+        device_id = torch.cuda.current_device()
+        tensor.data = tensor.data.to(device_id, non_blocking=True)
+
+    def load_group_to_gpu(group):
+        if group is None:
+            return
+
+        if isinstance(group, list):
+            for param_group in group:
+                if isinstance(param_group, list):
+                    for param in param_group:
+                        load_tensor_to_gpu(param)
+                else:
+                    load_tensor_to_gpu(param_group)
+        else:
+            load_tensor_to_gpu(group)
+
+    # Load all parameter groups to GPU for each underlying optimizer
+
+    for _opt in _iter_opts(optimizers):
+        if hasattr(_opt, "shard_fp32_from_float16_groups"):
+            load_group_to_gpu(_opt.shard_fp32_from_float16_groups)
+
+
+@torch.no_grad()
+def offload_megatron_optimizer(optimizers):
+    def _iter_opts(opt):
+        if isinstance(opt, ChainedOptimizer):
+            return opt.chained_optimizers
+        return [opt]
+
+    for _opt in _iter_opts(optimizers):
+        if _opt.optimizer is None:
+            # Stub sub-optimizer with no params on this rank, e.g. the dense group when
+            # LoRA only targets expert linears.
+            continue
+        offload_megatron_copy_params(_opt)
+        opt_state_dict_values = _opt.optimizer.state.values()
+        for v in opt_state_dict_values:
+            if "exp_avg" in v:
+                v["exp_avg"] = v["exp_avg"].to("cpu", non_blocking=True)
+            if "exp_avg_sq" in v:
+                v["exp_avg_sq"] = v["exp_avg_sq"].to("cpu", non_blocking=True)
+
+
+@torch.no_grad()
+def load_megatron_optimizer(optimizers):
+    def _iter_opts(opt):
+        if isinstance(opt, ChainedOptimizer):
+            return opt.chained_optimizers
+        return [opt]
+
+    for _opt in _iter_opts(optimizers):
+        if _opt.optimizer is None:
+            continue
+        load_megatron_copy_params(_opt)
+        # if we are using HybridDeviceOptimizer, we need to only move gpu optimizer state to gpu
+        if hasattr(_opt.optimizer, "_move_new_state_to_right_device"):
+            _opt.optimizer._move_new_state_to_right_device()
+        else:
+            opt_state_dict_values = _opt.optimizer.state.values()
+            for v in opt_state_dict_values:
+                if "exp_avg" in v:
+                    v["exp_avg"] = v["exp_avg"].to(torch.cuda.current_device(), non_blocking=True)
+                if "exp_avg_sq" in v:
+                    v["exp_avg_sq"] = v["exp_avg_sq"].to(torch.cuda.current_device(), non_blocking=True)
+
+
+def preprocess_packed_seqs(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    pre_process: bool = True,
+    sub_seq_lengths: Optional[list[list[int]]] = None,
+    fp8_enabled: bool = False,
+    fp8_recipe: Optional[str] = None,
+) -> tuple[torch.Tensor, PackedSeqParams]:
+    """
+    Preprocess packed sequences.
+
+    Two modes:
+
+    - ``sub_seq_lengths is None`` (default): each row is assumed to hold a
+      single sub-sequence whose length is recovered from
+      ``attention_mask.sum(dim=-1)``. ``cu_seqlens`` enumerates one entry
+      per row. This is the historical SkyRL behavior used by the RL path
+      and the existing SFT path without mini-batch packing.
+    - ``sub_seq_lengths is not None``: each row may contain multiple
+      sub-sequences. ``sub_seq_lengths[r]`` lists their valid token counts.
+      Each sub-sequence begins at the next ``align_size`` boundary, so internal
+      alignment padding may separate adjacent sub-sequences; any remaining
+      trailing tokens are pad. ``cu_seqlens`` enumerates every sub-sequence
+      across every row.
+
+    CP splits sequence into CP*2 chunks, and each GPU gets 2 chunks (GPU0
+    gets first and last chunks, GPU1 gets second and second last chunks,
+    and so on), this is for load balancing with causal masking.
+    See https://github.com/NVIDIA/TransformerEngine/issues/1368
+    """
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = mpu.get_context_parallel_rank()
+    align_size = get_packed_seq_align_size(tp_size, cp_size, fp8_enabled=fp8_enabled, fp8_recipe=fp8_recipe)
+
+    batch_size = input_ids.shape[0]
+
+    if sub_seq_lengths is not None:
+        if len(sub_seq_lengths) != batch_size:
+            raise ValueError(f"sub_seq_lengths has {len(sub_seq_lengths)} rows but batch size is {batch_size}")
+
+        # Flatten per-sub-seq lengths into a single 1-D tensor; the i-th
+        # entry of the flattened list maps to the i-th cu_seqlens segment.
+        flat_seqlens: list[int] = []
+        # Per-row, per-sub-seq starting column within the original padded row.
+        # We need this to gather sub-seq tokens from the padded input_ids.
+        # NOTE: the controller-side collator (``PackedDataCollator``)
+        # advances ``row_offset += round_up(length, align_size)`` between
+        # consecutive sub-sequences in the same row so that flash-attn varlen
+        # sees TP/CP-aligned segment boundaries. We MUST mirror that here —
+        # otherwise sub-seq i (for i > 0) would be read starting inside the
+        # alignment-pad gap of sub-seq i-1, returning pad tokens.
+        row_index_of_subseq: list[int] = []
+        intra_row_offset_of_subseq: list[int] = []
+        for r, lens in enumerate(sub_seq_lengths):
+            running = 0
+            for length in lens:
+                length_int = int(length)
+                flat_seqlens.append(length_int)
+                row_index_of_subseq.append(r)
+                intra_row_offset_of_subseq.append(running)
+                # Pad each sub-seq independently to align_size, matching the
+                # collator's row layout.
+                pad = (align_size - length_int % align_size) % align_size
+                running += length_int + pad
+
+        seqlens_in_batch = torch.tensor(flat_seqlens, dtype=torch.int32, device=input_ids.device)
+        num_subseqs = len(flat_seqlens)
+    else:
+        seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+        num_subseqs = batch_size
+
+    pad_size = (align_size - seqlens_in_batch % align_size) % align_size
+    seqlens_in_batch_padded = seqlens_in_batch + pad_size
+
+    cu_seqlens = torch.zeros(num_subseqs + 1, dtype=torch.int32, device=input_ids.device)
+    cu_seqlens[1:] = torch.cumsum(seqlens_in_batch, dim=0)
+    cu_seqlens_padded = torch.zeros(num_subseqs + 1, dtype=torch.int32, device=input_ids.device)
+    cu_seqlens_padded[1:] = torch.cumsum(seqlens_in_batch_padded, dim=0)
+
+    # ----------------------------------------------------------------------------
+    # Move the index information needed in the subsequent loop to the CPU at once,
+    # to avoid frequent .item() calls in the loop that cause D2H synchronization
+    # ----------------------------------------------------------------------------
+    seqlens_in_batch_cpu: list[int] = seqlens_in_batch.tolist()
+    seqlens_in_batch_padded_cpu: list[int] = seqlens_in_batch_padded.tolist()
+    cu_seqlens_padded_cpu: list[int] = cu_seqlens_padded.tolist()
+
+    # Pure Python int calculation to avoid further synchronization
+    max_seqlen_in_batch = max(seqlens_in_batch_padded_cpu)
+
+    shape = list(input_ids.shape[1:])
+    shape[0] = sum(seqlens_in_batch_padded_cpu) // cp_size
+    if pre_process:
+        input_ids_rmpad = torch.zeros(shape, dtype=input_ids.dtype, device=input_ids.device)
+        for i in range(num_subseqs):
+            if sub_seq_lengths is not None:
+                row_idx = row_index_of_subseq[i]
+                offset = intra_row_offset_of_subseq[i]
+                seqlen = seqlens_in_batch_cpu[i]
+                seq_tokens = input_ids[row_idx, offset : offset + seqlen]
+            else:
+                seqlen = seqlens_in_batch_cpu[i]
+                seq_tokens = input_ids[i, attention_mask[i]]
+
+            if cp_size <= 1:
+                start_idx = cu_seqlens_padded_cpu[i]
+                input_ids_rmpad[start_idx : start_idx + seqlen] = seq_tokens
+                continue
+
+            seqlen_padded_i = seqlens_in_batch_padded_cpu[i]
+            seqlen_cp = seqlen_padded_i // cp_size
+            half_seqlen = seqlen_cp // 2
+            start_idx = cu_seqlens_padded_cpu[i] // cp_size
+            d = seq_tokens
+            if d.shape[0] < seqlen_padded_i:
+                d = torch.nn.functional.pad(d, (0, seqlen_padded_i - d.shape[0]))
+            input_ids_rmpad[start_idx : start_idx + half_seqlen] = d[
+                half_seqlen * cp_rank : half_seqlen * (cp_rank + 1)
+            ]
+
+            remain_start = seqlen_padded_i - half_seqlen * (cp_rank + 1)
+            remain_end = seqlen_padded_i - half_seqlen * cp_rank
+            remain_end = min(remain_end, d.shape[0])
+            remain_len = remain_end - remain_start
+            if remain_len > 0:
+                input_ids_rmpad[start_idx + half_seqlen : start_idx + half_seqlen + remain_len] = d[
+                    remain_start:remain_end
+                ]
+
+    # Mamba derives per-token document labels from the global padded token count.
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_padded,
+        max_seqlen_q=max_seqlen_in_batch,
+        cu_seqlens_kv=cu_seqlens_padded,
+        max_seqlen_kv=max_seqlen_in_batch,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        total_tokens=cu_seqlens_padded_cpu[-1],
+    )
+    if pre_process:
+        return input_ids_rmpad.unsqueeze(0), packed_seq_params
+    else:
+        return input_ids, packed_seq_params
+
+
+def model_packs_sequences_internally(model: Union[nn.Module, List[nn.Module]]) -> bool:
+    """Whether the model packs sequences inside its own ``forward``.
+
+    True for ``Qwen3VLModel`` (e.g. Qwen3.5 via the VL bridge), which would
+    double-pack and corrupt the GDN ``cu_seqlens`` under SkyRL sample packing, so
+    :class:`MegatronModelWrapper` refuses packing for it. Returns ``False`` when
+    mbridge / Qwen3VL is not importable, so other models are unaffected.
+    """
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import (
+            Qwen3VLModel,
+        )
+    except ImportError:
+        return False
+
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    for chunk in chunks:
+        unwrapped = unwrap_model(chunk)
+        unwrapped_list = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+        if any(isinstance(m, Qwen3VLModel) for m in unwrapped_list):
+            return True
+    return False
+
+
+def remove_left_padding(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    pre_process: bool = True,
+    fp8_enabled: bool = False,
+    fp8_recipe: Optional[str] = None,
+):
+    """
+    Remove left padding from input_ids, attention_mask and position_ids
+    return new_input_ids, new_attention_mask, new_position_ids
+    """
+    assert attention_mask.ndim == 2
+    assert position_ids.ndim == 2
+    cp_size = mpu.get_context_parallel_world_size()
+    assert cp_size == 1, "Context parallel size without seq_pack is not supported"
+    batch_size = input_ids.shape[0]
+    shape = list(input_ids.shape)  # batch_size, seq_len,...
+    seq_lens = attention_mask.sum(dim=1)
+    seq_len = seq_lens.max().item()
+    align_size = get_unpacked_seq_align_size(
+        mpu.get_tensor_model_parallel_world_size(), fp8_enabled=fp8_enabled, fp8_recipe=fp8_recipe
+    )
+    pad_size = (align_size - seq_len % align_size) % align_size
+    seq_len = seq_len + pad_size
+    shape[1] = seq_len
+    if pre_process:
+        new_input_ids = torch.zeros(dtype=input_ids.dtype, device=input_ids.device, size=shape)
+    new_attention_mask = torch.zeros(
+        dtype=attention_mask.dtype, device=attention_mask.device, size=(batch_size, seq_len)
+    )
+    new_position_ids = torch.zeros(dtype=position_ids.dtype, device=position_ids.device, size=(batch_size, seq_len))
+    for i in range(batch_size):
+        if pre_process:
+            new_input_ids[i, : seq_lens[i]] = input_ids[i, attention_mask[i]]
+        new_attention_mask[i, : seq_lens[i]] = attention_mask[i, attention_mask[i]]
+        new_position_ids[i, : seq_lens[i]] = position_ids[i, attention_mask[i]]
+    if pre_process:
+        return new_input_ids, new_attention_mask, new_position_ids
+    else:
+        return input_ids, new_attention_mask, new_position_ids
+
+
+def recover_left_padding(
+    result,
+    attention_mask: torch.Tensor,
+    original_attention_mask: torch.Tensor,
+    origin_seqlen: int,
+    post_process: bool = True,
+):
+    """
+    Recover left padding from result
+    return result
+    """
+    if not post_process:
+        return result
+    shape = list(result.shape)
+    batch_size = shape[0]
+    shape[1] = origin_seqlen
+    new_result = torch.zeros(dtype=result.dtype, device=result.device, size=shape)
+    for i in range(batch_size):
+        new_result[i, original_attention_mask[i]] = result[i, attention_mask[i]]
+    return new_result
+
+
+def get_model_config(model):
+    return get_attr_wrapped_model(model, "config", allow_none=False)
+
+
+def broadcast_object_across_pp_ranks(obj, allow_missing: bool = False):
+    """Broadcast an object across pipeline parallel ranks.
+
+    From Nemo-RL: https://github.com/NVIDIA-NeMo/RL/blob/0a769cc3553a265dd1ca4648de0a7d0b1ad5ece6/nemo_rl/models/policy/megatron_policy_worker.py#L136
+
+    This utility function handles broadcasting an object from the rank that owns it
+    to all other pipeline parallel ranks. If only one rank has the object (non-None),
+    it will be broadcast to all other ranks.
+
+    Args:
+        obj: The object to broadcast. Can be None on ranks that don't own it.
+        allow_missing: If True, return None when *no* rank owns the object instead
+            of raising. Callers enumerating conversion tasks need this: since
+            megatron-bridge 0.7.0 a mapping registry can describe parameters that
+            the built model does not contain (see ``_init_param_buckets``).
+
+    Returns:
+        The object on all ranks (either the original or the broadcast copy), or
+        None if no rank owns it and ``allow_missing`` is set.
+
+    Raises:
+        ValueError: If the object doesn't exist on any pipeline parallel rank and
+            ``allow_missing`` is False.
+    """
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    pp_group = mpu.get_pipeline_model_parallel_group()
+
+    if pp_size == 1:
+        return obj
+
+    # ------------------------------------------------------------------
+    # 1. Gather presence flags from all PP ranks to find the source rank
+    # ------------------------------------------------------------------
+    has_obj = obj is not None
+    obj_flags = [None] * pp_size
+    torch.distributed.all_gather_object(obj_flags, has_obj, group=pp_group)
+
+    # ------------------------------------------------------------------
+    # 2. Identify the owning rank (the only rank with True flag)
+    # ------------------------------------------------------------------
+    src_rank = None  # Rank *inside* the PP group
+    for rank, flag in enumerate(obj_flags):
+        if flag:
+            src_rank = rank
+            break
+
+    if src_rank is None:
+        if allow_missing:
+            return None
+        raise ValueError("Object must exist on at least one PP rank")
+
+    # ------------------------------------------------------------------
+    # 3. Broadcast the object from the source rank to all ranks
+    # ------------------------------------------------------------------
+    # Use broadcast_object_list which is more robust than all_gather_object
+    obj_list = [obj]
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    global_src = pp_ranks[src_rank]
+    torch.distributed.broadcast_object_list(obj_list, src=global_src, group=pp_group)
+
+    return obj_list[0]
+
+
+def to_te_attention_mask(attention_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Convert a 2-D keep-mask to a 4-D padding mask for Transformer Engine attention.
+
+    ``remove_left_padding`` returns a 2-D ``[batch, seq]`` keep-mask where 1 marks a real token.
+    Transformer Engine's sliding-window ``get_full_mask`` expects a mask broadcastable to
+    ``[batch, 1, q_seq, kv_seq]``; a 2-D mask collides the batch dimension with the sequence
+    dimension and fails for ``micro_batch_size > 1``. Return a ``[batch, 1, 1, seq]`` padding mask
+    where True marks padding. A ``None`` mask (packed sequences) or an already higher-rank mask is
+    returned unchanged.
+    """
+    if attention_mask is None or attention_mask.dim() != 2:
+        return attention_mask
+    return (~attention_mask.bool())[:, None, None, :]
+
+
+def _clear_mtp_hybrid_pattern(provider) -> None:
+    """Drop the MTP block from a hybrid provider's layer pattern.
+
+    Setting ``mtp_num_layers = None`` is not enough for hybrid (Mamba/attention/MoE)
+    models such as NemotronH.  ``HybridModelProvider.finalize()`` appends
+    ``mtp_hybrid_override_pattern`` to ``hybrid_layer_pattern`` whenever that field is
+    set -- and because ``mtp_use_repeated_layer`` defaults to True it appends one copy
+    even for ``mtp_num_layers=None`` -- then re-infers the depth back out of the
+    combined pattern, undoing the disable.  Clearing the pattern too keeps the guard in
+    ``finalize()`` false so the head is never built.  No-op on providers without the
+    field (GPTModel-based MTP models like DeepSeek/GLM honor ``mtp_num_layers``).
+    """
+    if hasattr(provider, "mtp_hybrid_override_pattern"):
+        provider.mtp_hybrid_override_pattern = None

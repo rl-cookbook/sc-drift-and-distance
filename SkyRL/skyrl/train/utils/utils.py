@@ -1,0 +1,1591 @@
+import functools
+import ipaddress
+import logging
+import math
+import os
+import socket
+import sys
+import time
+from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import ray
+import torch
+from loguru import logger
+from ray.util.placement_group import (
+    PlacementGroup,
+    placement_group,
+    placement_group_table,
+)
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
+    has_visible_cuda_device,
+    is_blackwell_or_newer,
+    is_fp8_enabled,
+    resolve_auto_fp8_recipe,
+    resolve_auto_wire_format,
+    validate_concrete_fp8_recipe,
+)
+from skyrl.backends.skyrl_train.weight_sync.fp8 import (
+    AUTO_FP8,
+    BLOCKWISE_FP8,
+    WIRE_FORMATS,
+)
+from skyrl.env_vars import (
+    SKYRL_DUMP_INFRA_LOG_TO_STDOUT,
+    SKYRL_LD_LIBRARY_PATH_EXPORT,
+    SKYRL_PYTHONPATH_EXPORT,
+    SKYRL_RAY_PG_TIMEOUT_IN_S,
+    SKYRL_WORKER_NCCL_TIMEOUT_IN_S,
+)
+from skyrl.train.config.config import (
+    SUPPORTED_SPECULATIVE_DECODING_METHODS,
+    SkyRLTrainConfig,
+    get_config_as_dict,
+)
+from skyrl.train.utils import deadline
+
+
+class Timer:
+    """Times a block and names it as the current step-deadline stage (see ``deadline.stage``)."""
+
+    def __init__(self, message, update_dict=None):
+        self.message = message
+        self.update_dict = update_dict
+
+    def __enter__(self):
+        self.start_time = time.time()
+        self._stage = deadline.stage(self.message)
+        self._stage.__enter__()
+        logger.opt(depth=1).info(f"Started: '{self.message}'")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._stage.__exit__(exc_type, exc_val, exc_tb)
+        logger.opt(depth=1).info(f"Finished: '{self.message}', time cost: {time.time() - self.start_time:.2f}s")
+        if self.update_dict is not None:
+            self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + time.time() - self.start_time
+
+    async def __aenter__(self):
+        self.start_time = time.time()
+        self._stage = deadline.stage(self.message)
+        self._stage.__enter__()
+        logger.opt(depth=1).info(f"Started: '{self.message}'")
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._stage.__exit__(exc_type, exc_val, exc_tb)
+        logger.opt(depth=1).info(f"Finished: '{self.message}', time cost: {time.time() - self.start_time:.2f}s")
+        if self.update_dict is not None:
+            self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + time.time() - self.start_time
+
+
+def validate_batch_sizes(cfg: SkyRLTrainConfig):
+    """
+    Validate configured batch sizes.
+
+    Explanation of how batching operates:
+    1. Each prompt in train_batch_size creates `n_samples_per_prompt` total samples.
+    2. During training, these samples are split across data parallel (DP) workers, making the effective per-GPU
+       batch size: `train_batch_size * n_samples_per_prompt / dp_size`.
+    3. Mini batches are similarly normalized to per-gpu mini batches with size:
+       `mini_batch_size * n_samples_per_prompt / dp_size`.
+    4. Per-gpu train batch size must be divisible by per-gpu mini batch size, otherwise the last mini batch will
+       be incomplete.
+    5. Per-gpu mini batch size must be divisible by per-gpu micro batch size, otherwise the last micro batch will
+       be incomplete.
+    """
+    assert cfg.trainer.train_batch_size >= cfg.trainer.policy_mini_batch_size
+    assert cfg.trainer.policy_mini_batch_size > 0, "policy_mini_batch_size must be greater than 0"
+    if cfg.trainer.critic.model.path is not None:
+        assert cfg.trainer.train_batch_size >= cfg.trainer.critic_mini_batch_size
+        assert cfg.trainer.critic_mini_batch_size > 0, "critic_mini_batch_size must be greater than 0"
+    assert cfg.trainer.micro_train_batch_size_per_gpu > 0, "micro_train_batch_size_per_gpu must be greater than 0"
+    assert cfg.trainer.micro_forward_batch_size_per_gpu > 0, "micro_forward_batch_size_per_gpu must be greater than 0"
+
+    # Validate policy mini batch size
+    policy_world_size = cfg.trainer.placement.policy_num_nodes * cfg.trainer.placement.policy_num_gpus_per_node
+
+    if cfg.trainer.strategy == "megatron":
+        pp = cfg.trainer.policy.megatron_config.pipeline_model_parallel_size
+        cp = cfg.trainer.policy.megatron_config.context_parallel_size
+        tp = cfg.trainer.policy.megatron_config.tensor_model_parallel_size
+        assert policy_world_size % (pp * cp * tp) == 0, (
+            f"policy_world_size {policy_world_size} should be divisible by (pp * cp * tp) {pp * cp * tp}. "
+            "This ensures that the data parallel size is an integer."
+        )
+        policy_dp_size = policy_world_size // (pp * cp * tp)
+    else:
+        policy_dp_size = policy_world_size // cfg.trainer.policy.sequence_parallel_size
+
+    assert cfg.trainer.train_batch_size % cfg.trainer.policy_mini_batch_size == 0, (
+        f"train_batch_size {cfg.trainer.train_batch_size} should be divisible by "
+        f"policy_mini_batch_size {cfg.trainer.policy_mini_batch_size}"
+    )
+
+    # TODO(Charlie): For step-wise training, the number of sequences per prompt is variable, and
+    # padded mini-batch may not be divisible by dp_size. Should check if we need these assertions.
+    policy_mini_batch_size_per_gpu = (
+        cfg.trainer.policy_mini_batch_size * cfg.generator.n_samples_per_prompt // policy_dp_size
+    )
+    assert policy_mini_batch_size_per_gpu > 0, (
+        f"Invalid policy_mini_batch_size_per_gpu: {policy_mini_batch_size_per_gpu}. "
+        f"mini_batch_size={cfg.trainer.policy_mini_batch_size}, "
+        f"n_samples_per_prompt={cfg.generator.n_samples_per_prompt}, "
+        f"dp_size={policy_dp_size}"
+    )
+    assert policy_mini_batch_size_per_gpu % cfg.trainer.micro_train_batch_size_per_gpu == 0, (
+        f"normalized policy_mini_batch_size_per_gpu {policy_mini_batch_size_per_gpu} should be divisible "
+        f"by micro_train_batch_size_per_gpu {cfg.trainer.micro_train_batch_size_per_gpu}"
+    )
+    assert policy_mini_batch_size_per_gpu // cfg.trainer.micro_train_batch_size_per_gpu > 0, (
+        f"normalized policy_mini_batch_size_per_gpu {policy_mini_batch_size_per_gpu} should be larger than "
+        f"micro_train_batch_size_per_gpu {cfg.trainer.micro_train_batch_size_per_gpu}"
+    )
+    policy_train_batch_size_per_gpu = (
+        cfg.trainer.train_batch_size * cfg.generator.n_samples_per_prompt // policy_dp_size
+    )
+
+    # `train_batch_size_per_gpu` should be divisible by `policy_mini_batch_size_per_gpu`
+    assert policy_train_batch_size_per_gpu % policy_mini_batch_size_per_gpu == 0, (
+        f"normalized policy_train_batch_size_per_gpu (train_batch_size * n_samples_per_prompt // policy_dp_size) "
+        f"{policy_train_batch_size_per_gpu} should be divisible by policy_mini_batch_size_per_gpu "
+        f"(policy_mini_batch_size * n_samples_per_prompt // policy_dp_size) {policy_mini_batch_size_per_gpu}"
+    )
+
+    # Validate critic mini batch size
+    critic_world_size = cfg.trainer.placement.critic_num_nodes * cfg.trainer.placement.critic_num_gpus_per_node
+    critic_dp_size = critic_world_size // cfg.trainer.critic.sequence_parallel_size
+
+    if cfg.trainer.critic.model.path is not None:
+        assert cfg.trainer.train_batch_size % cfg.trainer.critic_mini_batch_size == 0, (
+            f"train_batch_size {cfg.trainer.train_batch_size} should be divisible by "
+            f"critic_mini_batch_size {cfg.trainer.critic_mini_batch_size}"
+        )
+        critic_mini_batch_size_per_gpu = (
+            cfg.trainer.critic_mini_batch_size * cfg.generator.n_samples_per_prompt // critic_dp_size
+        )
+        assert critic_mini_batch_size_per_gpu > 0, (
+            f"Invalid critic_mini_batch_size_per_gpu: {critic_mini_batch_size_per_gpu}. "
+            f"mini_batch_size={cfg.trainer.critic_mini_batch_size}, "
+            f"n_samples_per_prompt={cfg.generator.n_samples_per_prompt}, "
+            f"dp_size={critic_dp_size}"
+        )
+        assert critic_mini_batch_size_per_gpu % cfg.trainer.micro_train_batch_size_per_gpu == 0, (
+            f"normalized critic_mini_batch_size_per_gpu {critic_mini_batch_size_per_gpu} should be divisible by "
+            f"micro_train_batch_size_per_gpu {cfg.trainer.micro_train_batch_size_per_gpu}"
+        )
+        assert critic_mini_batch_size_per_gpu // cfg.trainer.micro_train_batch_size_per_gpu > 0, (
+            f"normalized critic_mini_batch_size_per_gpu {critic_mini_batch_size_per_gpu} should be larger than "
+            f"micro_train_batch_size_per_gpu {cfg.trainer.micro_train_batch_size_per_gpu}"
+        )
+        critic_train_batch_size_per_gpu = (
+            cfg.trainer.train_batch_size * cfg.generator.n_samples_per_prompt // critic_dp_size
+        )
+        assert critic_train_batch_size_per_gpu % critic_mini_batch_size_per_gpu == 0, (
+            f"normalized critic_train_batch_size_per_gpu (train_batch_size * n_samples_per_prompt // critic_dp_size) "
+            f"{critic_train_batch_size_per_gpu} should be divisible by critic_mini_batch_size_per_gpu "
+            f"(critic_mini_batch_size * n_samples_per_prompt // critic_dp_size) {critic_mini_batch_size_per_gpu}"
+        )
+
+    # Validate training batch size is larger than the least common multiple of the DP sizes of policy (and ref if used).
+    lcm_dp_size = policy_dp_size
+
+    use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
+    if use_ref_model:
+        ref_world_size = cfg.trainer.placement.ref_num_nodes * cfg.trainer.placement.ref_num_gpus_per_node
+        if cfg.trainer.strategy == "megatron":
+            pp = cfg.trainer.ref.megatron_config.pipeline_model_parallel_size
+            cp = cfg.trainer.ref.megatron_config.context_parallel_size
+            tp = cfg.trainer.ref.megatron_config.tensor_model_parallel_size
+            assert ref_world_size % (pp * cp * tp) == 0, (
+                f"ref_world_size {ref_world_size} should be divisible by (pp * cp * tp) {pp * cp * tp}. "
+                "This ensures that the data parallel size is an integer."
+            )
+            ref_dp_size = ref_world_size // (pp * cp * tp)
+        else:
+            ref_dp_size = ref_world_size // cfg.trainer.ref.sequence_parallel_size
+        lcm_dp_size = math.lcm(lcm_dp_size, ref_dp_size)
+
+    assert cfg.trainer.train_batch_size * cfg.generator.n_samples_per_prompt >= lcm_dp_size, (
+        f"train_batch_size * n_samples_per_prompt ({cfg.trainer.train_batch_size * cfg.generator.n_samples_per_prompt}) "
+        f"should be larger than or equal to the least common multiple of the data parallel sizes of the enabled models: "
+        f"policy_dp_size={policy_dp_size}, "
+        f"ref_dp_size={ref_dp_size if use_ref_model else 'None'}, "
+        f"lcm_dp_size={lcm_dp_size}"
+    )
+
+
+def validate_megatron_cfg(cfg: SkyRLTrainConfig):
+    # not yet supported + tested features
+    ie_cfg = cfg.generator.inference_engine
+    assert ie_cfg.weight_sync_backend in {
+        "nccl",
+        "delta",
+        "sharded_rdt",
+    }, "only nccl, delta and sharded_rdt are supported for megatron weight sync"
+    assert ie_cfg.backend == "vllm", "only vllm is supported for with megatron"
+    assert cfg.trainer.critic.model.path is None, "only GRPO training is currently supported for megatron"
+
+    policy_cfg = cfg.trainer.policy
+    policy_fp8_param = is_fp8_enabled(policy_cfg.megatron_config.transformer_config_kwargs.get("fp8_param"))
+    if (
+        policy_fp8_param
+        and not policy_cfg.inference_only_init
+        and not policy_cfg.megatron_config.ddp_config.fp8_param_gather
+    ):
+        raise ValueError(
+            "Persistent policy fp8_param training requires "
+            "trainer.policy.megatron_config.ddp_config.fp8_param_gather=true"
+        )
+
+    # Resolve fp8_recipe="auto" to the architecture-native recipe (blockwise on
+    # Hopper, mxfp8 on Blackwell) before the config is shipped to Ray actors.
+    # A GPU-less driver leaves "auto" in place — guessing here would bake the
+    # wrong recipe into every worker's config — and each Megatron worker then
+    # resolves and re-validates locally against its own device.
+    for worker_cfg in (cfg.trainer.policy, cfg.trainer.ref):
+        megatron_config = getattr(worker_cfg, "megatron_config", None)
+        transformer_kwargs = getattr(megatron_config, "transformer_config_kwargs", None)
+        if not transformer_kwargs:
+            continue
+        resolve_auto_fp8_recipe(transformer_kwargs)
+        validate_concrete_fp8_recipe(transformer_kwargs)
+
+    # Resolve fp8_weight_sync_mode="auto" from the policy's recipe so the
+    # rollout serves the representation the trainer computes with. This keys
+    # off the resolved recipe, never the architecture: an explicit
+    # fp8_recipe="blockwise" on Blackwell is legal (TE emulates it on the MX
+    # datapath) and must keep a blockwise wire, or train and rollout would
+    # disagree again -- the exact failure this sync path exists to prevent.
+    # A GPU-less driver may still hold fp8_recipe="auto" here; unlike the
+    # recipe, the wire cannot defer to the workers (it shapes every engine's
+    # boot config), so resolve_auto_wire_format refuses to guess and raises.
+    ie_cfg = cfg.generator.inference_engine
+    if ie_cfg.fp8_weight_sync_mode == AUTO_FP8:
+        policy_recipe = cfg.trainer.policy.megatron_config.transformer_config_kwargs.get("fp8_recipe")
+        ie_cfg.fp8_weight_sync_mode = resolve_auto_wire_format(policy_recipe)
+        logger.info(
+            "fp8_weight_sync_mode='auto' resolved to {!r} from fp8_recipe={!r}",
+            ie_cfg.fp8_weight_sync_mode,
+            policy_recipe,
+        )
+
+    if cfg.trainer.policy.megatron_config.moe_enable_routing_replay:
+        assert (
+            cfg.generator.inference_engine.enable_return_routed_experts
+        ), "rollout router replay (r3) is only supported when enable_return_routed_experts is True"
+
+    worker_configs = [(cfg.trainer.policy, "policy"), (cfg.trainer.ref, "ref")]
+    for config, worker_type in worker_configs:
+        # Megatron's fused top-k returns before compute_topk consults router_replay
+        # (moe_utils.topk_routing_with_score_function), so the replayed experts are
+        # silently discarded while R3 still pays its full cost. Refuse the pair rather
+        # than train against routing that does not match the rollout.
+        if config.megatron_config.moe_enable_routing_replay:
+            assert not config.megatron_config.transformer_config_kwargs.get("moe_router_fusion"), (
+                f"{worker_type}.megatron_config: moe_enable_routing_replay is incompatible with "
+                "moe_router_fusion=True -- the fused router bypasses replay. Set moe_router_fusion=False."
+            )
+            # Interleaved chunks desynchronise each RouterReplay instance's backward FIFO.
+            vpp_size = config.megatron_config.transformer_config_kwargs.get("virtual_pipeline_model_parallel_size")
+            assert vpp_size is None or vpp_size <= 1, (
+                f"{worker_type}.megatron_config: moe_enable_routing_replay is incompatible with "
+                "virtual_pipeline_model_parallel_size -- interleaved chunks desync the replay FIFO. "
+                "Unset virtual_pipeline_model_parallel_size."
+            )
+        # context, expert, and expert tensor parallel are not yet supported for megatron
+        if config.megatron_config.context_parallel_size > 1:
+            assert (
+                cfg.trainer.remove_microbatch_padding
+            ), "context parallel is only supported with remove_microbatch_padding"
+        # check that sequence parallel is not configured outside of megatron
+        assert config.sequence_parallel_size == 1, (
+            f"found {worker_type}.sequence_parallel_size={config.sequence_parallel_size}, ulysses style sequence "
+            f"parallel is not supported for megatron"
+        )
+
+
+# TODO (sumanthrh): Most of this should be moved to  __post_init__ for the dataclasses
+def _apply_mtp_config(cfg: SkyRLTrainConfig):
+    """Propagate the high-level ``trainer.mtp`` knob to the training + inference configs: train the
+    model's native MTP heads with the decoupled draft loss and enable vLLM MTP speculative decoding.
+    The vLLM draft depth (``num_speculative_tokens``) is decoupled from the trained head count
+    (depth > 1 reuses the head autoregressively). When disabled, force the heads off.
+    """
+    mtp = getattr(cfg.trainer, "mtp", None)
+    if mtp is None:
+        return
+
+    mcfg = cfg.trainer.policy.megatron_config
+    if not mtp.enabled:
+        # Explicit 0 force-disables MTP even on MTP-capable models.
+        mcfg.mtp_num_layers = 0
+        return
+
+    assert mtp.num_speculative_tokens >= 1, "trainer.mtp.num_speculative_tokens must be >= 1 when enabled"
+    if mcfg.mtp_num_layers == 0:
+        raise ValueError(
+            "trainer.mtp.enabled=true but trainer.policy.megatron_config.mtp_num_layers=0 "
+            "(explicit force-disable). Remove the mtp_num_layers override or disable trainer.mtp."
+        )
+    # Leave mcfg.mtp_num_layers untouched (None => megatron-bridge infers the head count from the
+    # model's HF config; MegatronWorker fails loud if it resolves to zero while MTP is enabled).
+    mcfg.mtp_loss_weight = mtp.loss_weight
+
+    # SKYRL_DISABLE_SPEC=1: train the MTP heads, but keep the vLLM rollout plain autoregressive.
+    if os.environ.get("SKYRL_DISABLE_SPEC") == "1":
+        return
+
+    # Inference side: vLLM MTP speculative decoding with the same draft depth. Don't clobber an
+    # explicit user-provided speculative_config.
+    ie_cfg = cfg.generator.inference_engine
+    if ie_cfg.speculative_config is None:
+        ie_cfg.speculative_config = {
+            "method": "mtp",
+            "num_speculative_tokens": mtp.num_speculative_tokens,
+        }
+
+
+def validate_score_centering_cfg(cfg: SkyRLTrainConfig) -> None:
+    """Validate ``trainer.algorithm.score_centering`` and derive the sampler settings it needs.
+
+    Score centering needs the sampler's head (ids and logprobs) for every generated token. It rides on
+    the sample-support channel: ``enable_return_sample_support_set`` records the head ids and
+    ``enable_return_sample_support_logprobs`` adds their sampler logprobs. With an untruncated sampler
+    (``top_k = -1``) the head is the top-``score_centering.top_k`` tokens, so ``sampling_params.logprobs``
+    is set to that value; with a truncating sampler (``top_k > 1``) the head is the sampler's support.
+    """
+    score_centering = cfg.trainer.algorithm.score_centering
+    if score_centering.kl_anchor_beta > 0 and score_centering.kl_anchor_schedule == "inv_sqrt_age":
+        steps_per_rollout = cfg.trainer.train_batch_size // cfg.trainer.policy_mini_batch_size
+        if score_centering.kl_anchor_minibatches != steps_per_rollout:
+            raise ValueError(
+                "`trainer.algorithm.score_centering.kl_anchor_schedule=inv_sqrt_age` needs `kl_anchor_minibatches` "
+                f"equal to the mini-batches per rollout ({steps_per_rollout}), "
+                f"got {score_centering.kl_anchor_minibatches}."
+            )
+    exact_kl = score_centering.kl_anchor_beta > 0 and score_centering.kl_anchor_estimator == "exact_head"
+    if exact_kl and not score_centering.enabled:
+        raise ValueError(
+            "`trainer.algorithm.score_centering.kl_anchor_estimator=exact_head` needs the sampler's top-k head, "
+            "so `trainer.algorithm.score_centering.enabled=true`."
+        )
+    if not score_centering.enabled:
+        return
+    algorithm = cfg.trainer.algorithm
+    if cfg.trainer.strategy not in ("fsdp", "megatron"):
+        raise NotImplementedError(
+            "`trainer.algorithm.score_centering` is only supported with `trainer.strategy=fsdp` or "
+            f"`megatron`, got {cfg.trainer.strategy}."
+        )
+    if algorithm.policy_loss_type not in ("rollout_is", "reinforce", "token_tis"):
+        raise ValueError(
+            "`trainer.algorithm.score_centering` requires `trainer.algorithm.policy_loss_type` to be "
+            f"`reinforce`, `rollout_is` or `token_tis`, got {algorithm.policy_loss_type}."
+        )
+    if algorithm.off_policy_correction.tis_ratio_type is not None:
+        raise ValueError(
+            "`trainer.algorithm.score_centering` cannot be combined with "
+            "`trainer.algorithm.off_policy_correction.tis_ratio_type`; the truncated importance weight is "
+            "computed against the old policy and is not folded into the centering weights."
+        )
+    if cfg.generator.step_wise_trajectories:
+        raise NotImplementedError("`trainer.algorithm.score_centering` does not support step-wise trajectories.")
+    if cfg.generator.vision_language_generator:
+        raise NotImplementedError("`trainer.algorithm.score_centering` does not support vision_language_generator.")
+    sampling_params = cfg.generator.sampling_params
+    if sampling_params.top_k <= 1:
+        num_logprobs = sampling_params.logprobs
+        if num_logprobs is not None and num_logprobs > 1 and num_logprobs != score_centering.top_k:
+            raise ValueError(
+                f"`generator.sampling_params.logprobs`={num_logprobs} conflicts with "
+                f"`trainer.algorithm.score_centering.top_k`={score_centering.top_k}; leave `logprobs` unset."
+            )
+        sampling_params.logprobs = score_centering.top_k
+    ie_cfg = cfg.generator.inference_engine
+    ie_cfg.enable_return_sample_support_set = True
+    ie_cfg.enable_return_sample_support_logprobs = True
+    if cfg.trainer.strategy == "megatron" and not cfg.trainer.fused_lm_head_logprob:
+        # With materialized logits the head members would be gathered from a [tokens, vocab] tensor and
+        # their backward would allocate a second gradient of that size; the fused path projects the
+        # members through the LM head instead, so the head costs O(tokens * k).
+        logger.warning(
+            "`trainer.algorithm.score_centering` on Megatron requires `trainer.fused_lm_head_logprob=true`; "
+            "enabling it."
+        )
+        cfg.trainer.fused_lm_head_logprob = True
+
+
+def _validate_draft_weight_sync_cfg(cfg: SkyRLTrainConfig):
+    """Speculative decoding drafts with the policy's MTP head, so every weight sync must reach it."""
+    ie_cfg = cfg.generator.inference_engine
+    spec = ie_cfg.speculative_config
+    if spec is None:
+        return
+    if cfg.trainer.strategy != "megatron":
+        raise ValueError(
+            f"speculative_config={spec} syncs the drafter from the policy's MTP head, which requires "
+            f"trainer.strategy='megatron' (got {cfg.trainer.strategy!r}): the FSDP model carries no MTP head"
+        )
+    from skyrl.backends.skyrl_train.weight_sync import get_transfer_strategy
+
+    if get_transfer_strategy(ie_cfg.weight_sync_backend, cfg.trainer.placement.colocate_all) == "sharded_rdt":
+        raise ValueError(
+            f"speculative_config={spec} is not supported with weight_sync_backend={ie_cfg.weight_sync_backend!r}: "
+            "its pull plan targets one model. Use 'nccl' or 'delta'."
+        )
+    if ie_cfg.fp8_weight_sync_mode is not None:
+        raise ValueError(
+            f"speculative_config={spec} is not supported with fp8_weight_sync_mode={ie_cfg.fp8_weight_sync_mode!r}: "
+            "the drafter has no loader for the serialized FP8 wire format"
+        )
+    if cfg.trainer.policy.model.lora.rank > 0 and not cfg.trainer.policy.megatron_config.lora_config.merge_lora:
+        raise ValueError(
+            f"speculative_config={spec} needs full-weight sync to keep the drafter aligned; "
+            "Megatron LoRA with merge_lora=false syncs adapters only"
+        )
+
+
+def validate_step_timeouts(step_timeout_s: Optional[float], weight_sync_timeout_s: Optional[float]) -> None:
+    for name, value in (("step_timeout_s", step_timeout_s), ("weight_sync_timeout_s", weight_sync_timeout_s)):
+        if value is None:
+            continue
+        if value <= 0:
+            raise ValueError(f"trainer.{name} must be > 0, got {value}")
+        if value < SKYRL_WORKER_NCCL_TIMEOUT_IN_S:
+            logger.warning(
+                f"trainer.{name}={value} is below SKYRL_WORKER_NCCL_TIMEOUT_IN_S={SKYRL_WORKER_NCCL_TIMEOUT_IN_S}: "
+                "the driver will give up on a stuck collective before the NCCL watchdog reports it."
+            )
+    if step_timeout_s is not None and weight_sync_timeout_s is not None and weight_sync_timeout_s > step_timeout_s:
+        raise ValueError(
+            f"trainer.weight_sync_timeout_s ({weight_sync_timeout_s}) must be <= trainer.step_timeout_s "
+            f"({step_timeout_s})"
+        )
+
+
+def validate_cfg(cfg: SkyRLTrainConfig):
+    if cfg.trainer.strategy == "fsdp2":
+        import warnings
+
+        warnings.warn(
+            "trainer.strategy='fsdp2' has been renamed to 'fsdp'; use 'fsdp' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        cfg.trainer.strategy = "fsdp"
+
+    if cfg.trainer.max_training_steps is not None:
+        if cfg.trainer.max_training_steps <= 0:
+            raise ValueError(f"max_training_steps must be > 0, got {cfg.trainer.max_training_steps}")
+
+    validate_step_timeouts(cfg.trainer.step_timeout_s, cfg.trainer.weight_sync_timeout_s)
+
+    # Validate generation config separately
+    validate_generator_cfg(cfg)
+
+    # Multi-Token Prediction (MTP): the high-level `trainer.mtp` knob is the single source of truth.
+    # Propagate it to the training side (Megatron MTP heads + decoupled draft loss) and the inference
+    # side (vLLM MTP speculative decoding) so both stay consistent.
+    _apply_mtp_config(cfg)
+    _validate_draft_weight_sync_cfg(cfg)
+
+    from skyrl.backends.skyrl_train.utils.ppo_utils import (
+        AdvantageEstimatorRegistry,
+        PolicyLossRegistry,
+        repopulate_all_registries,
+    )
+
+    assert (
+        cfg.trainer.sequence_parallel_backend == "ulysses"
+    ), f"only ulysses is supported as of now, got {cfg.trainer.sequence_parallel_backend}"
+
+    # if advantage estimator is GAE, then critic path should be provided
+    if cfg.trainer.algorithm.advantage_estimator == "gae":
+        assert (
+            cfg.trainer.critic.model.path
+        ), "`trainer.critic.model.path` should be provided for PPO training, got `None`"
+
+    assert not (
+        cfg.trainer.algorithm.use_kl_in_reward and cfg.trainer.algorithm.use_kl_loss
+    ), "use_kl_in_reward and use_kl_loss should be mutually exclusive"
+    use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
+
+    if cfg.trainer.policy.language_model_only:
+        assert (
+            cfg.generator.inference_engine.language_model_only
+        ), f"language_model_only should be set consistently between inference engine and policy but got {cfg.generator.inference_engine.language_model_only} for generator and {cfg.trainer.policy.language_model_only} for policy"
+        if use_ref_model:
+            assert cfg.trainer.ref.language_model_only
+    validate_batch_sizes(cfg)
+
+    if cfg.trainer.max_ckpts_to_keep == 0:
+        raise ValueError(
+            "`max_ckpts_to_keep` must be greater than 0 to keep the last N checkpoints "
+            "or negative to keep all checkpoints"
+        )
+
+    cfg.trainer.policy.torch_profiler_config.validate(
+        strategy=cfg.trainer.strategy,
+        colocate_all=cfg.trainer.placement.colocate_all,
+        colocate_policy_ref=cfg.trainer.placement.colocate_policy_ref,
+        fsdp_cpu_offload=cfg.trainer.policy.fsdp_config.cpu_offload,
+    )
+
+    # TODO (devpatel): move to initializing ray and syncing registries codepath at startup
+    repopulate_all_registries()
+    available_policy_losses = PolicyLossRegistry.list_available()
+    assert available_policy_losses != [], "Policy loss registry is not populated."
+
+    assert (
+        cfg.trainer.algorithm.policy_loss_type in available_policy_losses
+    ), f"invalid policy_loss_type: {cfg.trainer.algorithm.policy_loss_type}. Must be one of {available_policy_losses}"
+
+    available_advantage_estimators = AdvantageEstimatorRegistry.list_available()
+    assert cfg.trainer.algorithm.advantage_estimator in available_advantage_estimators, (
+        f"invalid advantage_estimator: {cfg.trainer.algorithm.advantage_estimator}. "
+        f"Must be one of {available_advantage_estimators}"
+    )
+
+    # Step-wise training collapses each trajectory to a single scalar advantage that is broadcast
+    # uniformly to every step's response tokens. This only makes sense for outcome-based estimators.
+    # Temporal estimators (GAE, REINFORCE++) produce per-token advantages, which the broadcast
+    # discards. Reject the combination explicitly.
+    if cfg.generator.step_wise_trajectories and cfg.trainer.algorithm.advantage_estimator in ("gae", "reinforce++"):
+        raise ValueError(
+            f"advantage_estimator={cfg.trainer.algorithm.advantage_estimator!r} is not supported with "
+            f"step_wise_trajectories=True. The step-wise branch collapses each trajectory to a single "
+            f"scalar advantage, which discards the per-token temporal structure these estimators produce, "
+            f"and the estimator only sees the last step's slice — there is no cross-step temporal "
+            f"connection. Use an outcome-based estimator (grpo, rloo, maxrl) or disable "
+            f"step_wise_trajectories."
+        )
+    if cfg.generator.step_wise_trajectories and cfg.trainer.algorithm.loss_reduction == "token_mean_legacy":
+        # TODO(Charlie): this can be fixed, can revisit later.
+        raise ValueError(
+            "`token_mean_legacy` loss reduction is not supported with step-wise training. Use `token_mean` instead."
+        )
+
+    # Step-wise rows may carry routes when each row's routes are its own (see
+    # `_validate_per_token_side_channels`); SkyRLGymGenerator's step-wise mode refuses them itself. Merging
+    # rows into one sequence doesn't carry routes, so refuse that here rather than mid-run.
+    if cfg.generator.merge_stepwise_output and cfg.generator.inference_engine.enable_return_routed_experts:
+        raise ValueError(
+            "`generator.inference_engine.enable_return_routed_experts=True` is not supported with "
+            "`generator.merge_stepwise_output=True`: prefix-aware merging does not merge routed experts."
+        )
+
+    if cfg.generator.merge_stepwise_output and not cfg.generator.step_wise_trajectories:
+        raise ValueError(
+            "`generator.merge_stepwise_output=True` requires `generator.step_wise_trajectories=True`. "
+            "Prefix-aware merging operates on step-wise GeneratorOutput entries (trajectory_ids + "
+            "is_last_step), which only exist when step-wise training is enabled."
+        )
+
+    assert cfg.trainer.algorithm.loss_reduction in (
+        "token_mean",
+        "token_mean_legacy",
+        "sequence_mean",
+        "seq_mean_token_sum_norm",
+        "prompt_mean",
+    ), (
+        f"invalid loss_reduction: {cfg.trainer.algorithm.loss_reduction}. "
+        f"Must be one of `['token_mean', 'token_mean_legacy', 'sequence_mean', "
+        f"'seq_mean_token_sum_norm', 'prompt_mean']`"
+    )
+    if cfg.trainer.algorithm.loss_reduction == "seq_mean_token_sum_norm":
+        if cfg.trainer.algorithm.max_seq_len is None:
+            raise ValueError(
+                "`trainer.algorithm.max_seq_len` must be set explicitly when "
+                "`trainer.algorithm.loss_reduction='seq_mean_token_sum_norm'`. "
+                "Choose the total sequence-length normalization constant for your setup; "
+                "this often matches the model context window / vLLM `max_model_len` when appropriate."
+            )
+
+    # TODO (erictang000): remove this after deprecation period
+    if cfg.trainer.algorithm.use_tis:
+        logger.warning(
+            f"`trainer.algorithm.use_tis` is deprecated. Setting `trainer.algorithm.off_policy_correction` to `token` instead."
+            f"with `token_tis_ratio_clip_high`={cfg.trainer.algorithm.tis_imp_ratio_cap}"
+        )
+        cfg.trainer.algorithm.off_policy_correction.tis_ratio_type = "token"
+        cfg.trainer.algorithm.off_policy_correction.token_tis_ratio_clip_high = cfg.trainer.algorithm.tis_imp_ratio_cap
+
+    validate_score_centering_cfg(cfg)
+
+    # off_policy_correction config validation
+    off_policy_correction = cfg.trainer.algorithm.off_policy_correction
+    tis_ratio_type = off_policy_correction.tis_ratio_type
+    sequence_mask_metric = off_policy_correction.sequence_mask_metric
+
+    uses_off_policy_correction = tis_ratio_type is not None or sequence_mask_metric is not None
+
+    if uses_off_policy_correction:
+        # Validate tis_ratio_type
+        if tis_ratio_type:
+            assert tis_ratio_type in [
+                "token",
+                "sequence",
+            ], f"`tis_ratio_type` must be 'None', 'token', or 'sequence', got {tis_ratio_type}"
+
+        # Validate sequence_mask_metric
+        if sequence_mask_metric:
+            assert sequence_mask_metric in [
+                "product",
+                "geometric",
+            ], f"`sequence_mask_metric` must be 'product', or 'geometric', got {sequence_mask_metric}"
+
+        # Ensure logprobs are enabled for rollout correction
+        if cfg.generator.sampling_params.logprobs is None:
+            logger.warning(
+                "`generator.sampling_params.logprobs` is `None` but off_policy_correction is enabled."
+                " Setting `logprobs` to `1`."
+            )
+            cfg.generator.sampling_params.logprobs = 1
+
+        if cfg.trainer.algorithm.policy_loss_type in ["clip_cov", "kl_cov"]:
+            raise NotImplementedError(
+                "`trainer.algorithm.off_policy_correction` doesn't support clip_cov or kl_cov policy loss types"
+            )
+
+    if cfg.trainer.policy.model.lora.rank > 0:
+        # LoRA enabled: generator backend must be vllm, training backend must be fsdp or megatron
+        assert cfg.generator.inference_engine.backend == "vllm", "LoRA enabled requires vLLM backend"
+        megatron_lora_cfg = cfg.trainer.policy.megatron_config.lora_config
+        if megatron_lora_cfg.experts_shared_outer_loras and megatron_lora_cfg.lora_type != "lora":
+            raise ValueError(
+                "`megatron_config.lora_config.experts_shared_outer_loras` is only supported with "
+                f'`lora_type="lora"`, got lora_type="{megatron_lora_cfg.lora_type}"'
+            )
+
+        # delta weight sync is not yet supported
+        # TODO (sumanthrh): Delta weight sync should be naturally supported for `merge_lora=true`, we should
+        # test and enable this in a follow-up. `merge_lora=false` needs bookkeeping of per-LoRA safetensors
+        # on the inference side.
+        assert (
+            cfg.generator.inference_engine.weight_sync_backend != "delta"
+        ), "Delta weight sync is not yet supported for LoRA"
+
+    # Validate placement
+    if cfg.trainer.placement.colocate_all:
+        num_policy_gpus = cfg.trainer.placement.policy_num_gpus_per_node * cfg.trainer.placement.policy_num_nodes
+        ie_cfg = cfg.generator.inference_engine
+        num_rollout_gpus = (
+            ie_cfg.num_engines * ie_cfg.tensor_parallel_size * ie_cfg.pipeline_parallel_size * ie_cfg.data_parallel_size
+        )
+        assert num_policy_gpus == num_rollout_gpus, (
+            f"num_policy_gpus ({num_policy_gpus}) and num_rollout_gpus ({num_rollout_gpus}) "
+            "must be the same when colocating all models"
+        )
+    else:
+        if cfg.trainer.placement.colocate_policy_ref and use_ref_model:
+            assert cfg.trainer.placement.policy_num_nodes == cfg.trainer.placement.ref_num_nodes, (
+                f"policy_num_nodes ({cfg.trainer.placement.policy_num_nodes}) and ref_num_nodes "
+                f"({cfg.trainer.placement.ref_num_nodes}) must be the same when colocate policy and ref model."
+            )
+            assert cfg.trainer.placement.policy_num_gpus_per_node == cfg.trainer.placement.ref_num_gpus_per_node, (
+                f"policy_num_gpus_per_node ({cfg.trainer.placement.policy_num_gpus_per_node}) and "
+                f"ref_num_gpus_per_node ({cfg.trainer.placement.ref_num_gpus_per_node}) must be the same "
+                f"when colocate policy and ref model."
+            )
+
+
+def validate_generator_cfg(cfg: SkyRLTrainConfig):
+    """Validates the correctness of generator-related config.
+
+    Args:
+        cfg (SkyRLTrainConfig): config to validate
+
+    Raises:
+        NotImplementedError: if feature is not supported
+        ValueError: when cfg.generator.sampling_params.logprobs > 1
+    """
+    if cfg.generator.max_turns == 1:
+        assert (
+            cfg.generator.max_input_length == cfg.trainer.max_prompt_length
+        ), "max_input_length should be set equal to trainer.max_prompt_length for single-turn generation"
+    else:
+        assert cfg.generator.max_input_length >= cfg.trainer.max_prompt_length, (
+            "max_input_length should be set greater than or equal to trainer.max_prompt_length "
+            "for multi-turn generation"
+        )
+
+    # TODO(tgriggs): use a more modular config validation
+    if cfg.trainer.logger == "wandb":
+        assert os.environ.get("WANDB_API_KEY"), "`WANDB_API_KEY` is required for `wandb` logger"
+
+    if cfg.generator.sampling_params.logprobs is not None:
+        assert isinstance(cfg.generator.sampling_params.logprobs, int)
+        if cfg.generator.sampling_params.logprobs > 1 and not cfg.trainer.algorithm.score_centering.enabled:
+            raise ValueError(
+                f"`logprobs` if set should be 0 or 1 (both return only the chosen token's logprob), "
+                f"got {cfg.generator.sampling_params.logprobs}. Values above 1 are only used by "
+                "`trainer.algorithm.score_centering`."
+            )
+
+    if cfg.trainer.strategy == "megatron":
+        validate_megatron_cfg(cfg)
+    if cfg.generator.use_conversation_multi_turn:
+        if (
+            cfg.generator.sampling_params.stop is not None or cfg.generator.eval_sampling_params.stop is not None
+        ) and not cfg.generator.append_eos_token_after_stop_str_in_multi_turn:
+            logger.warning(
+                "WARNING: `sampling_params.stop` and `eval_sampling_params.stop` are specified and we "
+                "are using multi-turn generation. You might want to set `append_eos_token_after_stop_str_in_multi_turn`"
+                " to `True` to append tokenizer.eos_token_id to the assistant-generated response "
+                "to match the chat template."
+            )
+
+    # Validate inference-engine instantiation / serving topology (shared with
+    # the inference-only serve entrypoint).
+    validate_inference_engine_cfg(cfg)
+
+
+def validate_inference_engine_cfg(cfg: SkyRLTrainConfig):
+    """Validates inference-engine config independent of generator/training semantics.
+
+    Covers engine instantiation and serving topology
+
+    Shared between the training path (via :func:`validate_generator_cfg`) and the
+    inference-only serve entrypoint (``skyrl.train.entrypoints.serve``).
+
+    Args:
+        cfg (SkyRLTrainConfig): config to validate
+
+    Raises:
+        ValueError / NotImplementedError / AssertionError: on invalid combinations.
+    """
+    ie_cfg = cfg.generator.inference_engine
+
+    # "auto" resolves from the trainer recipe in validate_megatron_cfg; a
+    # config path that never runs it (the serve entrypoint, non-megatron
+    # strategies) has no recipe to resolve from, so reject it with the way out
+    # instead of listing "auto" as an accepted value here.
+    if ie_cfg.fp8_weight_sync_mode == AUTO_FP8:
+        raise ValueError(
+            'fp8_weight_sync_mode="auto" resolves from the trainer recipe on the megatron '
+            f"training path only; set one of {WIRE_FORMATS!r} explicitly for this entrypoint."
+        )
+    if ie_cfg.fp8_weight_sync_mode not in (None, *WIRE_FORMATS):
+        raise ValueError(
+            f"Unsupported fp8_weight_sync_mode={ie_cfg.fp8_weight_sync_mode!r}; "
+            f"expected one of {(*WIRE_FORMATS, AUTO_FP8)!r} or None"
+        )
+    if ie_cfg.fp8_weight_sync_mode in WIRE_FORMATS:
+        if cfg.trainer.strategy != "megatron":
+            raise ValueError("FP8 weight sync requires trainer.strategy='megatron'")
+        if ie_cfg.weight_sync_backend in {"sharded_rdt", "delta"}:
+            # Neither backend can carry the quantized payload + scale pairs that
+            # FP8 weight sync is made of: the RDT weight sources export bridge
+            # tensors cast to the inference dtype, and the delta checkpoint format
+            # cannot represent the marker names and scale tensors. Both senders
+            # refuse at send time too, but vLLM is built with quantization="fp8"
+            # and load_format="dummy" long before the first sync, so the model is
+            # already loaded by then.
+            raise ValueError(
+                "FP8 weight sync is not supported with "
+                f"weight_sync_backend={ie_cfg.weight_sync_backend!r}; use 'nccl'"
+            )
+        lora_cfg = cfg.trainer.policy.model.lora
+        if lora_cfg.rank > 0 and not cfg.trainer.policy.megatron_config.lora_config.merge_lora:
+            raise ValueError(
+                "FP8 weight sync requires full-weight updates; "
+                "Megatron LoRA with merge_lora=false syncs adapters only"
+            )
+
+    lora_cfg = cfg.trainer.policy.model.lora
+    if lora_cfg.sync_mode not in {"disk", "memory"}:
+        raise ValueError(f"trainer.policy.model.lora.sync_mode must be 'disk' or 'memory', got {lora_cfg.sync_mode!r}")
+    if lora_cfg.sync_mode == "memory":
+        # The adapter rides the base-model transport (NCCL broadcast / CUDA IPC)
+        # into the receive engine, which stages it for vLLM's LoRA manager. The
+        # other backends have no such stream to carry it: delta publishes
+        # checkpoint diffs and sharded_rdt bakes a pull plan into model params.
+        if cfg.trainer.strategy != "megatron":
+            raise ValueError("lora.sync_mode='memory' is only implemented for trainer.strategy='megatron'")
+        if lora_cfg.rank <= 0 or cfg.trainer.policy.megatron_config.lora_config.merge_lora:
+            raise ValueError(
+                "lora.sync_mode='memory' requires lora.rank > 0 and megatron_config.lora_config.merge_lora=false"
+            )
+        if ie_cfg.weight_sync_backend != "nccl":
+            raise ValueError(
+                "lora.sync_mode='memory' requires generator.inference_engine.weight_sync_backend='nccl' "
+                f"(CUDA IPC when colocated), got {ie_cfg.weight_sync_backend!r}"
+            )
+
+    if ie_cfg.enable_pd:
+        assert ie_cfg.num_prefill > 0, "num_prefill must be > 0 when enable_pd=True"
+        assert (
+            ie_cfg.num_prefill < ie_cfg.num_engines
+        ), "num_prefill must be < num_engines (need at least one decode worker)"
+        assert ie_cfg.num_engines >= 2, "num_engines must be >= 2 for PD disaggregation"
+
+    # Role-specific engine kwargs for PD disaggregation.
+    if ie_cfg.prefill_init_kwargs or ie_cfg.decode_init_kwargs:
+        if not ie_cfg.enable_pd:
+            raise ValueError(
+                "generator.inference_engine.prefill_init_kwargs / decode_init_kwargs "
+                "are only valid with enable_pd=true."
+            )
+        if ie_cfg.engine_init_kwargs:
+            raise ValueError(
+                "generator.inference_engine.engine_init_kwargs cannot be combined with "
+                "prefill_init_kwargs / decode_init_kwargs. Move all engine overrides "
+                "(including shared ones like kv_transfer_config) into the role-specific "
+                "prefill_init_kwargs and decode_init_kwargs."
+            )
+        # Completeness: role-specific kwargs replace engine_init_kwargs entirely, so each
+        # role must carry its own kv_transfer_config. Fail fast here rather than at
+        # serve-setup time in get_pd_cli_args (which raises per-role once the engine starts).
+        for role in ("prefill", "decode"):
+            role_kwargs = getattr(ie_cfg, f"{role}_init_kwargs")
+            if "kv_transfer_config" not in role_kwargs:
+                raise ValueError(
+                    f"generator.inference_engine.{role}_init_kwargs must set kv_transfer_config when "
+                    "using role-specific PD kwargs. Both prefill_init_kwargs and decode_init_kwargs must "
+                    "be fully specified (each with its own kv_transfer_config)."
+                )
+
+    # Validate inference engine parallelism.
+    ep_size = ie_cfg.expert_parallel_size
+    dp_size = ie_cfg.data_parallel_size
+    tp_size = ie_cfg.tensor_parallel_size
+    if ep_size > 1:
+        assert dp_size * tp_size == ep_size, (
+            f"If inference expert parallel is enabled, data parallel size * tensor parallel size must equal expert "
+            f"parallel size. "
+            f"Got dp_size={dp_size}, tp_size={tp_size}, ep_size={ep_size}"
+        )
+
+    assert ie_cfg.distributed_executor_backend in ("mp", "ray"), "invalid distributed executor backend"
+
+    if ie_cfg.enable_return_routed_experts:
+        # vLLM captures routes per worker, into a buffer covering only that worker's layers, and
+        # only the last pipeline stage returns model output. With inference PP > 1 the routes of
+        # every earlier stage's MoE layers are silently dropped (left as expert 0). This holds for
+        # both executor backends. The ray backend itself is fine: vLLM copies the routed-expert
+        # arrays out of Ray's shared-memory channel before the next read (v1/executor/ray_utils.py).
+        assert ie_cfg.pipeline_parallel_size == 1, (
+            "rollout router replay (r3) requires generator.inference_engine.pipeline_parallel_size=1: "
+            "vLLM returns routed experts only from the last pipeline stage, so earlier stages' routes "
+            "would be lost. Scale the inference engine with tensor/expert parallelism instead."
+        )
+        assert (
+            cfg.trainer.strategy == "megatron"
+        ), "rollout router replay (r3) is only supported with Megatron training backend"
+        assert (
+            cfg.trainer.policy.megatron_config.moe_enable_routing_replay
+        ), "moe_enable_routing_replay must be True to consume rollout expert indices"
+
+    pp_size = ie_cfg.pipeline_parallel_size
+    tp_pp_size = tp_size * pp_size
+    num_gpus_per_node = cfg.trainer.placement.policy_num_gpus_per_node
+    if (
+        cfg.trainer.placement.colocate_all
+        and tp_pp_size > num_gpus_per_node
+        and ie_cfg.distributed_executor_backend == "mp"
+    ):
+        raise ValueError(
+            "Each inference engine DP rank (TP*PP workers) must fit within a single node with the vLLM mp backend. Use the ray backend for per engine multi-node serving instead."
+        )
+
+    # Validate the non-colocated sleep-during-weight-sync option.
+    if ie_cfg.offload_kv_for_weight_sync:
+        assert not cfg.trainer.placement.colocate_all, (
+            "offload_kv_for_weight_sync is for non-colocated weight sync only; "
+            "colocated mode already sleeps the engines and wakes weights/KV cache around sync."
+        )
+        assert cfg.trainer.policy.model.lora.rank == 0, (
+            "offload_kv_for_weight_sync does not support LoRA weight sync "
+            "(the in-place LoRA adapter swap path does not go through the sleep/wake broadcast)."
+        )
+        assert (
+            ie_cfg.weight_sync_backend != "delta"
+        ), "Offloading KV cache during weight sync is not supported for delta weight sync"
+
+    # Validate speculative decoding. `method` is required rather than left to vLLM's
+    # inference from the draft model config, so an unsupported drafter cannot reach the
+    # engine implicitly.
+    if ie_cfg.speculative_config is not None:
+        method = get_config_as_dict(ie_cfg.speculative_config).get("method")
+        if method not in SUPPORTED_SPECULATIVE_DECODING_METHODS:
+            raise ValueError(
+                f"invalid `generator.inference_engine.speculative_config.method`: {method!r}. "
+                f"Must be one of {list(SUPPORTED_SPECULATIVE_DECODING_METHODS)}."
+            )
+
+    # Validate new inference config options
+    _validate_new_inference_cfg(cfg)
+
+
+def _validate_new_inference_cfg(cfg: SkyRLTrainConfig):
+    """Validates config options for the inference layer.
+
+    Config combinations:
+    - Colocated + external URLs -> ERROR (requires driver-managed servers for PG sharing)
+    - run_engines_locally=False + no external URLs -> ERROR
+    - Neither set + run_engines_locally=True -> Build servers internally
+    - external_server_urls only -> Create router over external servers
+    - external_proxy_url only -> Use proxy for both data + control plane
+    - Both set -> Fully external (proxy for data plane, servers for control plane)
+
+    Args:
+        cfg: The config to validate.
+
+    Raises:
+        ValueError: If colocated mode is used with external URLs.
+    """
+    is_colocated = cfg.trainer.placement.colocate_all
+    has_external_proxy = cfg.generator.inference_engine.external_proxy_url is not None
+    has_external_servers = cfg.generator.inference_engine.external_server_urls is not None
+
+    # Colocated mode cannot use external endpoints
+    if is_colocated and (has_external_proxy or has_external_servers):
+        raise ValueError(
+            "Cannot use external_proxy_url or external_server_urls with colocate_all=true. "
+            "Colocated mode requires driver-managed inference servers to share placement groups "
+            "between trainer and inference workers. Please either:\n"
+            "  1. Set colocate_all=false to use external inference servers, or\n"
+            "  2. Remove external_proxy_url and external_server_urls to build servers internally."
+        )
+
+    if not cfg.generator.inference_engine.run_engines_locally and not (has_external_proxy or has_external_servers):
+        raise ValueError(
+            "generator.inference_engine.run_engines_locally=false requires "
+            "external_proxy_url or external_server_urls."
+        )
+
+
+@ray.remote
+def get_all_env_variables():
+    import os
+
+    return os.environ
+
+
+def ray_noset_visible_devices(env_vars=os.environ):
+    # Refer to
+    # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/nvidia_gpu.py#L95-L96
+    # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/amd_gpu.py#L102-L103
+    # https://github.com/ray-project/ray/blob/3b9e729f6a669ffd85190f901f5e262af79771b0/python/ray/_private/accelerators/amd_gpu.py#L114-L115
+    # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/npu.py#L94-L95
+    # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/hpu.py#L116-L117
+    # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/neuron.py#L108-L109
+    # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/tpu.py#L171-L172
+    # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/intel_gpu.py#L97-L98
+    NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES",
+        "RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES",
+        "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
+        "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
+    ]
+    return any(env_vars.get(env_var) for env_var in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST)
+
+
+def get_physical_gpu_id():
+    import torch
+
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return str(props.uuid)
+
+
+def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
+    """
+    Prepare environment variables for Ray runtime environment.
+
+    Args:
+        cfg: Training config
+
+    Returns:
+        Dict[str, str]: Environment variables to be used in Ray runtime environment
+    """
+    # TODO(sumanthrh): introduce a debug mode and add debugging flags like `CUDA_LAUNCH_BLOCKING` here
+    env_vars = {}
+    annotation_cfg = cfg.trainer.grafana_annotations
+    if annotation_cfg.enabled and (token := os.environ.get(annotation_cfg.token_env_var)):
+        env_vars[annotation_cfg.token_env_var] = token
+
+    # TileLang JITs kernels by shelling out to nvcc, and picks its toolkit from CUDA_HOME,
+    # defaulting to the pip wheel tree (site-packages/nvidia/cu13). That tree can be internally
+    # inconsistent -- e.g. nvidia-cuda-nvcc==13.3 next to nvidia-cuda-runtime==13.0 -- and
+    # nvidia-cuda-cccl then rejects the pair at compile time with "CUDA compiler and CUDA toolkit
+    # headers are incompatible". Pointing CUDA_HOME at a self-consistent system toolkit
+    # (e.g. /usr/local/cuda-13.3) fixes it. Workers are re-exec'd through the runtime env, so a
+    # plain driver export does not reach them; forward it here for both trainer and engine actors.
+    if os.environ.get("CUDA_HOME"):
+        env_vars["CUDA_HOME"] = os.environ["CUDA_HOME"]
+
+    # NOTE (erictang000): This should no longer be required since this has been removed in vllm
+    # and fixed in NCCL (https://github.com/vllm-project/vllm/pull/24141, https://github.com/NVIDIA/nccl/issues/1234), but empirically seeing OOMs for
+    # that previously ran successfully, so keeping this to maintain backwards compatibility.
+    if cfg.generator.inference_engine.weight_sync_backend == "nccl":
+        env_vars["NCCL_CUMEM_ENABLE"] = "0"
+
+    if cfg.trainer.strategy == "megatron":
+        # this is needed for megatron-core >= 0.15.0, which requires devices to be visible while importing megatron.core
+        env_vars["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
+        # useful when tp > 1 (and thus megatron sequence_parallel is enabled)
+        # see: https://github.com/NVIDIA/Megatron-LM/issues/533#issuecomment-1760193239
+        env_vars["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+        # Propagate fla's GDN backend choice to Ray workers. Default 1 keeps fla's
+        # TileLang default (works on Hopper); export FLA_TILELANG=0 on Blackwell (B200),
+        # where the TileLang packed backward aborts, to fall back to the Triton kernels.
+        env_vars["FLA_TILELANG"] = os.environ.get("FLA_TILELANG", "1")
+        if cfg.trainer.flash_attn:
+            # disable fused attention for megatron with flash_attn
+            # (otherwise flash_attn choice is overridden in TransformerEngine for Hopper+ devices)
+            # https://github.com/NVIDIA/TransformerEngine/blob/release_v2.5/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L916
+            env_vars["NVTE_FUSED_ATTN"] = "0"
+
+        # Forward TransformerEngine attention-backend debug logging to workers when
+        # set on the driver. Workers are re-exec'd through the runtime env (e.g. the
+        # uv hook), so a plain raylet/driver export does not reach them.
+        for nvte_var in ("NVTE_DEBUG", "NVTE_DEBUG_LEVEL"):
+            if os.environ.get(nvte_var):
+                env_vars[nvte_var] = os.environ[nvte_var]
+
+    if cfg.generator.inference_engine.backend == "vllm":
+        env_vars["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "true"
+
+        # NOTE (sumanthrh): In vllm >= 0.9.0, we need to explicitly allow for serialization via pickle
+        # for collective RPCs. During weight transfer, we use IPC handles, which contains a `function`
+        # object and requires pickling.
+        env_vars["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+        # vLLM torch compile is default enabled, we leave it as-is and propagate any user-supplied
+        # overrides for `VLLM_DISABLE_COMPILE_CACHE`
+        # TODO (sumanthrh): Test with shared storage in a multi-node env where we can persist cache
+        if os.environ.get("VLLM_DISABLE_COMPILE_CACHE"):
+            logger.info(
+                "Exporting `VLLM_DISABLE_COMPILE_CACHE` to ray runtime env: "
+                f"{os.environ['VLLM_DISABLE_COMPILE_CACHE']}"
+            )
+            env_vars["VLLM_DISABLE_COMPILE_CACHE"] = os.environ["VLLM_DISABLE_COMPILE_CACHE"]
+
+        if not os.environ.get("VLLM_USE_V1", False):
+            logger.info(
+                "`VLLM_USE_V1` is not specified, setting `VLLM_USE_V1` to 1. To override, set `VLLM_USE_V1` explicitly"
+            )
+            env_vars["VLLM_USE_V1"] = "1"
+            env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+        if os.environ.get("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"):
+            logger.info(
+                f"Exporting `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` to ray runtime env: {os.environ['VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS']}"
+            )
+            env_vars["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"] = os.environ["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"]
+
+        if os.environ.get("RAY_CGRAPH_get_timeout"):
+            logger.info(
+                f"Exporting `RAY_CGRAPH_get_timeout` to ray runtime env: {os.environ['RAY_CGRAPH_get_timeout']}"
+            )
+            env_vars["RAY_CGRAPH_get_timeout"] = os.environ["RAY_CGRAPH_get_timeout"]
+
+    # Use max of available GPU counts, defaulting to 1 if none found
+    gpu_counts = []
+    if hasattr(cfg.generator, "inference_engine") and hasattr(cfg.generator.inference_engine, "tensor_parallel_size"):
+        gpu_counts.append(cfg.generator.inference_engine.tensor_parallel_size)
+    if hasattr(cfg, "trainer") and hasattr(cfg.trainer, "placement"):
+        placement = cfg.trainer.placement
+        gpu_counts.extend(
+            [
+                placement.policy_num_gpus_per_node,
+                placement.critic_num_gpus_per_node,
+                placement.ref_num_gpus_per_node,
+            ]
+        )
+    max_num_gpus_per_node = max(gpu_counts) if gpu_counts else 1
+    if not peer_access_supported(max_num_gpus_per_node=max_num_gpus_per_node):
+        logger.info("Peer access is not supported on this node type, disabling NCCL P2P and SHM")
+        env_vars["NCCL_P2P_DISABLE"] = "1"
+        env_vars["NCCL_SHM_DISABLE"] = "1"
+
+    if os.environ.get("NCCL_NET_PLUGIN"):
+        logger.info(f"Exporting NCCL_NET_PLUGIN to ray runtime env: {os.environ['NCCL_NET_PLUGIN']}")
+        env_vars["NCCL_NET_PLUGIN"] = os.environ["NCCL_NET_PLUGIN"]
+
+    # TODO: this can be removed if we standardize on env files.
+    # But it's helpful for a quickstart
+    if os.environ.get("WANDB_API_KEY"):
+        logger.info("Exporting wandb api key to ray runtime env")
+        env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
+
+    if os.environ.get("MLFLOW_TRACKING_URI"):
+        logger.info("Exporting mlflow tracking uri to ray runtime env")
+        env_vars["MLFLOW_TRACKING_URI"] = os.environ["MLFLOW_TRACKING_URI"]
+
+    if os.environ.get("MLFLOW_TRACKING_TOKEN"):
+        logger.info("Exporting mlflow tracking token to ray runtime env")
+        env_vars["MLFLOW_TRACKING_TOKEN"] = os.environ["MLFLOW_TRACKING_TOKEN"]
+
+    # NOTE(charlie): these are for Harbor. We should remove these once we have a sustainable way to handle these environment vars.
+    for var_name in ["DAYTONA_API_KEY", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"]:
+        if value := os.environ.get(var_name):
+            logger.info(f"Exporting {var_name} to ray runtime env")
+            env_vars[var_name] = value
+
+    if SKYRL_LD_LIBRARY_PATH_EXPORT:
+        # export `LD_LIBRARY_PATH` to ray runtime env.
+        # For some reason the `LD_LIBRARY_PATH` is not exported to the worker with .env file.
+        logger.info(f"Exporting `LD_LIBRARY_PATH` to ray runtime env: {os.environ['LD_LIBRARY_PATH']}")
+        env_vars["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+
+    if SKYRL_PYTHONPATH_EXPORT:
+        # allow pythonpath to be updated as a fall back for deps that are not shipped with UV
+        # not recommended since it can cause unexpected conflicts with UV packages,
+        # but keeping for backwards compatibility
+        logger.info(f"Exporting `PYTHONPATH` to ray runtime env: {os.environ['PYTHONPATH']}")
+        env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
+
+    # Forward uv's project-environment selection to the workers. Ray's uv runtime-env hook makes each
+    # worker re-run `uv run ... --extra <backend>`, and that subprocess must resolve to the SAME venv
+    # as the driver. Workers are spawned by the raylet and only inherit env vars we forward here, so a
+    # driver-only `UV_PROJECT_ENVIRONMENT` (e.g. from a local `.env`) would otherwise be lost and the
+    # worker's `uv run` would fall back to the empty project `.venv` (-> `No module named 'megatron'`).
+    for var_name in (
+        "UV_PROJECT_ENVIRONMENT",
+        "UV_CACHE_DIR",
+        "UV_LINK_MODE",
+        "UV_PYTHON",
+        "UV_OFFLINE",
+        # HuggingFace cache/auth: model paths resolve against HF_HOME, so a
+        # driver-only setting (e.g. from a local `.env` pointing at a big data
+        # volume) must reach the worker actors or they re-download to ~/.cache.
+        "HF_HOME",
+        "HF_TOKEN",
+        "HF_HUB_OFFLINE",
+        "HF_ENDPOINT",
+        "PYTORCH_CUDA_ALLOC_CONF",
+        # Selects the DSA indexer top-k backend under dsa_kernel_backend=cudnn
+        # (patches/megatron/patch_dsa_hybrid_indexer.py); read in the Megatron workers.
+        "SKYRL_DSA_INDEXER_BACKEND",
+        # Debug/trace knobs — forwarded so they reach the worker actors, not just the driver.
+        "CUDA_LAUNCH_BLOCKING",
+        "PYTHONFAULTHANDLER",
+        "TORCH_SHOW_CPP_STACKTRACES",
+        "TORCH_USE_CUDA_DSA",
+        "NCCL_DEBUG",
+    ):
+        if value := os.environ.get(var_name):
+            logged_value = "[REDACTED]" if var_name == "HF_TOKEN" else value
+            logger.info(f"Exporting `{var_name}` to ray runtime env: {logged_value}")
+            env_vars[var_name] = value
+
+    # Forward any SKYRL_* overrides set in the launching shell (e.g.
+    # SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S for very large models
+    # whose weight load exceeds the 600s default) — skyrl.env_vars reads them at
+    # import time in every process, so they must ride the runtime env.
+    forwarded = {k: v for k, v in os.environ.items() if k.startswith("SKYRL_") and k not in env_vars}
+    if forwarded:
+        logger.info(f"Exporting SKYRL_* overrides to ray runtime env: {sorted(forwarded)}")
+    env_vars.update(forwarded)
+
+    # Forward one block-scale contract to all Ray actors. Hopper defaults to FP32
+    # scales; Blackwell (SM100+) defaults to power-of-two scales, the only mode TE
+    # supports for blockwise quantization there (it emulates Float8BlockScaling on
+    # the MX datapath).
+    # Both env vars below belong to the blockwise wire's scale contract
+    # (Float8BlockScaling / DeepGEMM); the MXFP8 wire serves through
+    # compressed-tensors with native E8M0 scales and takes no pins.
+    blockwise_wire = cfg.generator.inference_engine.fp8_weight_sync_mode == BLOCKWISE_FP8
+    use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
+    policy_megatron_config = getattr(cfg.trainer.policy, "megatron_config", None)
+    ref_megatron_config = getattr(cfg.trainer.ref, "megatron_config", None)
+    policy_transformer_kwargs = getattr(policy_megatron_config, "transformer_config_kwargs", None) or {}
+    ref_transformer_kwargs = getattr(ref_megatron_config, "transformer_config_kwargs", None) or {}
+    policy_fp8_param = is_fp8_enabled(policy_transformer_kwargs.get("fp8_param"))
+    ref_fp8_param = use_ref_model and is_fp8_enabled(ref_transformer_kwargs.get("fp8_param"))
+    fp8_compute = is_fp8_enabled(policy_transformer_kwargs.get("fp8")) or (
+        use_ref_model and is_fp8_enabled(ref_transformer_kwargs.get("fp8"))
+    )
+    fp8_contract_enabled = blockwise_wire or fp8_compute or policy_fp8_param or ref_fp8_param
+
+    fp8_env_defaults: dict[str, str] = {}
+    configured_scale_mode = os.environ.get("NVTE_FP8_BLOCK_SCALING_FP32_SCALES")
+    if fp8_contract_enabled or configured_scale_mode is not None:
+        if configured_scale_mode is None and not has_visible_cuda_device():
+            # The block-scale contract must be identical in every actor, so it is
+            # fixed here, before ray.init ships it in the runtime env — too early
+            # to probe the cluster. A GPU-less head cannot infer the workers'
+            # architecture, and defaulting to the Hopper contract would silently
+            # hand FP32 block scales to Blackwell workers, where TE emulates
+            # blockwise on the MX datapath and only supports power-of-2 scales.
+            raise ValueError(
+                "FP8 is enabled but this driver sees no CUDA device, so the block-scale "
+                "contract cannot be inferred from the workers' architecture. Export "
+                "NVTE_FP8_BLOCK_SCALING_FP32_SCALES explicitly: '0' (power-of-2 scales) "
+                "on Blackwell/SM100+, '1' (FP32 scales) on Hopper."
+            )
+        scale_mode = configured_scale_mode or ("0" if is_blackwell_or_newer() else "1")
+        if scale_mode not in {"0", "1"}:
+            raise ValueError("NVTE_FP8_BLOCK_SCALING_FP32_SCALES must be '0' (power-of-2) " "or '1' (FP32 scales).")
+
+        if scale_mode == "0" and (policy_fp8_param or ref_fp8_param):
+            raise ValueError(
+                "Persistent fp8_param requires FP32 block scales. Blackwell only supports "
+                "power-of-2 block scales, so use fp8_param=false on Blackwell."
+            )
+
+        if fp8_contract_enabled:
+            fp8_env_defaults["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] = scale_mode
+        if blockwise_wire and scale_mode == "1":
+            e8m0_mode = os.environ.get("VLLM_USE_DEEP_GEMM_E8M0", "0")
+            if e8m0_mode != "0":
+                raise ValueError(
+                    "FP32 block scales require VLLM_USE_DEEP_GEMM_E8M0=0 so vLLM "
+                    "does not requantize them to power-of-2 scales."
+                )
+            fp8_env_defaults["VLLM_USE_DEEP_GEMM_E8M0"] = e8m0_mode
+        elif blockwise_wire and scale_mode == "0":
+            # The symmetric rule, and a property of the wire format rather than of
+            # this process's device: power-of-2 scales are exactly representable in
+            # E8M0, so vLLM's requantization is lossless. vLLM then picks the
+            # per-device form itself (UE8M0 on SM100/SM120, FP32-ceil-to-UE8M0 on
+            # Hopper), which is why this default must not be gated on the driver's
+            # architecture — a GPU-less head would drop it. SM100 DeepGEMM also
+            # rejects the alternative outright ("Unsupported architecture or
+            # scaling factor types" with VLLM_USE_DEEP_GEMM_E8M0=0).
+            e8m0_mode = os.environ.get("VLLM_USE_DEEP_GEMM_E8M0", "1")
+            if e8m0_mode != "1":
+                raise ValueError(
+                    "Power-of-2 block scales require VLLM_USE_DEEP_GEMM_E8M0=1: they "
+                    "requantize to E8M0 losslessly, and Blackwell DeepGEMM accepts no "
+                    "other scale factor type. Unset the variable or set it to 1."
+                )
+            fp8_env_defaults["VLLM_USE_DEEP_GEMM_E8M0"] = e8m0_mode
+
+    for var_name in (
+        "NVTE_FP8_BLOCK_SCALING_FP32_SCALES",
+        "VLLM_USE_DEEP_GEMM_E8M0",
+    ):
+        if value := os.environ.get(var_name, fp8_env_defaults.get(var_name)):
+            logger.info(f"Exporting `{var_name}` to ray runtime env: {value}")
+            env_vars[var_name] = value
+
+    return env_vars
+
+
+def configure_ray_worker_logging() -> None:
+    """
+    Configure logging for Ray workers.
+
+    This method:
+    1. Forces color and formatting for Loguru (even without TTY)
+    2. Routes stdlib logging through Loguru
+
+    Note: This does NOT redirect stdout/stderr. For infra actors (vLLM, workers),
+    call redirect_actor_output_to_file() separately in their __init__.
+    """
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+
+    # 1) Loguru formatting (force colors)
+    logger.remove()
+    logger.level("INFO", color="<bold><green>")
+    logger.add(
+        sys.stderr,
+        colorize=True,  # keep ANSI even without a TTY
+        level=level_name,  # ensure Loguru filters below this level
+        enqueue=True,
+        backtrace=False,
+        diagnose=False,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+        "<level>{message}</level>",
+    )
+
+    # 2) Route stdlib logging -> Loguru (so vLLM/transformers/etc. are formatted)
+    class _InterceptHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            try:
+                level = logger.level(record.levelname).name
+            except ValueError:
+                level = record.levelno
+            logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+
+    logging.root.handlers = [_InterceptHandler()]
+    level = getattr(logging, level_name, logging.INFO)
+    logging.root.setLevel(level)
+
+
+def initialize_ray(cfg: SkyRLTrainConfig):
+    """
+    Initialize Ray cluster with prepared runtime environment.
+
+    Args:
+        cfg: Training config
+    """
+    from skyrl.backends.skyrl_train.utils.ppo_utils import sync_registries
+
+    # When SKYRL_DUMP_INFRA_LOG_TO_STDOUT=1, show all logs on stdout (no file redirect)
+    verbose_logging = SKYRL_DUMP_INFRA_LOG_TO_STDOUT
+
+    # Suppress Ray backend logs unless in verbose mode
+    if not verbose_logging:
+        os.environ["RAY_BACKEND_LOG_LEVEL"] = "fatal"
+
+    env_vars = prepare_runtime_environment(cfg)
+
+    # Set up log file for infrastructure logs (skip when dumping to stdout)
+    if not verbose_logging:
+        log_path = Path(cfg.trainer.log_path).resolve()
+        log_path.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
+        log_file = str(log_path / f"infra-{timestamp}.log")
+        os.environ["SKYRL_LOG_FILE"] = log_file
+        # Pass log file path to workers so they can redirect their output
+        env_vars["SKYRL_LOG_FILE"] = log_file
+
+    # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
+    # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
+    ray.init(runtime_env={"env_vars": env_vars}, log_to_driver=True)
+
+    if not verbose_logging:
+        logger.info(f"Infrastructure logs will be written to: {log_file}")
+
+    # create the named ray actors for the registries to make available to all workers
+    sync_registries()
+
+
+def get_ray_pg_ready_with_timeout(pg: PlacementGroup, timeout: int = 60):
+    try:
+        ray.get(pg.ready(), timeout=timeout)
+    except Exception as e:
+        # Extract resource demands from the placement group
+        bundles = pg.bundle_specs
+        total_gpus = sum(bundle.get("GPU", 0) for bundle in bundles)
+        total_cpus = sum(bundle.get("CPU", 0) for bundle in bundles)
+
+        raise RuntimeError(
+            f"Failed to create placement group with {len(bundles)} bundles "
+            f"(requiring {total_gpus} GPUs, {total_cpus} CPUs total) in {timeout} seconds. "
+            f"This might indicate insufficient GPU resources.\n"
+            f"Error: {e}"
+        )
+
+
+@ray.remote(num_gpus=1)
+class InfoActor:
+    def get_gpu_id(self):
+        return ray.get_gpu_ids()[0]
+
+
+def _probe_bundle_placement(pg):
+    """Probe every bundle in a placement group to get (bundle_idx, node_id, gpu_id) tuples.
+
+    Spawns a lightweight InfoActor per bundle to discover physical GPU assignments,
+    then returns the tuples sorted by (node_id, gpu_id) for deterministic ordering.
+    """
+    pg_data = placement_group_table(pg)
+    num_bundles = len(pg_data["bundles"])
+    bundle_to_node_ids = pg_data["bundles_to_node_id"]
+
+    info_actors = []
+    for i in range(num_bundles):
+        info_actors.append(
+            InfoActor.options(
+                num_cpus=0.01,
+                num_gpus=0.01,
+                resources=None,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=i,
+                ),
+            ).remote()
+        )
+
+    gpu_ids = ray.get([actor.get_gpu_id.remote() for actor in info_actors])
+    for actor in info_actors:
+        ray.kill(actor)
+
+    bundle_infos = [(i, bundle_to_node_ids[i], gpu_ids[i]) for i in range(num_bundles)]
+    return sorted(bundle_infos, key=lambda x: (x[1], x[2]))
+
+
+class ResolvedPlacementGroup:
+    """Wrapper around Ray PlacementGroup that resolves physical ordering of bundles and stores reordered bundle indices.
+
+    Ray placement groups don't guarantee bundle ordering (bundles on the same node
+    may not have consecutive indices). This wrapper probes the PG once on first access
+    and caches the full (bundle_idx, node_id, gpu_id) mapping sorted by (node_id, gpu_id).
+
+    All attributes are lazy and computed on first access.
+    Use ``.pg`` to access the underlying Ray PlacementGroup for Ray APIs.
+
+    Attributes:
+        reordered_bundle_indices: Raw bundle indices sorted by (node_id, gpu_id).
+        bundle_node_ids: Node ID for each reordered bundle index.
+        bundle_gpu_ids: Physical GPU ID for each reordered bundle index.
+        num_nodes: Number of distinct nodes in the placement group.
+        num_gpus_per_node: Number of GPUs per node (assumes uniform distribution).
+    """
+
+    def __init__(self, pg: PlacementGroup):
+        self.pg = pg
+        self._bundle_placement = None
+
+    def _get_bundle_placement(self):
+        if self._bundle_placement is None:
+            self._bundle_placement = _probe_bundle_placement(self.pg)
+        return self._bundle_placement
+
+    @functools.cached_property
+    def reordered_bundle_indices(self):
+        return [info[0] for info in self._get_bundle_placement()]
+
+    @functools.cached_property
+    def bundle_node_ids(self):
+        """Node ID for each reordered bundle index."""
+        return [info[1] for info in self._get_bundle_placement()]
+
+    @functools.cached_property
+    def bundle_gpu_ids(self):
+        """Physical GPU ID for each reordered bundle index."""
+        return [info[2] for info in self._get_bundle_placement()]
+
+    @functools.cached_property
+    def num_nodes(self):
+        return len(set(self.bundle_node_ids))
+
+    @functools.cached_property
+    def num_gpus_per_node(self):
+        return len(self._get_bundle_placement()) // self.num_nodes
+
+
+def torch_dtype_to_str(dtype: torch.dtype) -> str:
+    if dtype == torch.bfloat16:
+        return "bfloat16"
+    elif dtype == torch.float16:
+        return "float16"
+    elif dtype == torch.float32:
+        return "float32"
+    else:
+        return str(dtype)
+
+
+def str_to_torch_dtype(dtype: str) -> torch.dtype:
+    if dtype == "bfloat16":
+        return torch.bfloat16
+    elif dtype == "float16":
+        return torch.float16
+    elif dtype == "float32":
+        return torch.float32
+    else:
+        return torch.dtype(dtype)
+
+
+def format_gib(mem_bytes: int) -> str:
+    return f"{mem_bytes / (1024 ** 3):.2f} GiB"
+
+
+def print_mem(tag: str, mem: dict):
+    logger.info(
+        f"{tag} - Allocated: {format_gib(mem['allocated'])}, "
+        f"Reserved: {format_gib(mem['reserved'])}, "
+        f"Free: {format_gib(mem['free'])}, "
+        f"Total: {format_gib(mem['total'])}"
+    )
+
+
+def run_p2p_access_check():
+    device_count = torch.cuda.device_count()
+    if device_count < 2:
+        return False
+
+    # Check P2P access between all GPU pairs
+    for i in range(device_count):
+        for j in range(device_count):
+            if i != j:
+                # This checks if device i can access device j's memory
+                can_access = torch.cuda.can_device_access_peer(i, j)
+                if not can_access:
+                    return False
+
+    return True
+
+
+def peer_access_supported(max_num_gpus_per_node: int):
+    # whatever the max num gpus per node is, we can check p2p access if there are at least 2 GPUs
+    # if max is 1, p2p access is not supported
+    if max_num_gpus_per_node <= 1:
+        return False
+
+    if not torch.cuda.is_available():
+        # we are on cpu head node, so we need to check P2P access on a node with 2 GPUs
+        ray.init()
+        pg = placement_group([{"CPU": 1, "GPU": 2}], strategy="PACK")
+        get_ray_pg_ready_with_timeout(pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
+        result = ray.get(
+            ray.remote(num_gpus=2, scheduling_strategy=PlacementGroupSchedulingStrategy(pg))(
+                run_p2p_access_check
+            ).remote()
+        )
+        ray.shutdown()
+        return result
+    else:
+        return run_p2p_access_check()
+
+
+def update_model_config(module_config, override_config_kwargs):
+    """Return a copy of ``module_config`` with ``override_config_kwargs`` applied.
+
+    The returned config is a deep copy, so the caller's input is left
+    unmodified. Nested dict values in ``override_config_kwargs`` recurse into
+    the corresponding sub-config attribute (which is already part of the deep
+    copy, so the recursion mutates the copy in place).
+
+    Args:
+        module_config: The module config from Huggingface Transformers.
+        override_config_kwargs: The kwargs to override the module config.
+
+    Returns:
+        A new module config with the overrides applied.
+    """
+    new_config = deepcopy(module_config)
+    _apply_overrides_in_place(new_config, override_config_kwargs)
+    return new_config
+
+
+def _apply_overrides_in_place(module_config, override_config_kwargs):
+    """Apply override kwargs to ``module_config`` in place (used for sub-configs)."""
+    for key, val in override_config_kwargs.items():
+        if isinstance(val, dict):
+            _apply_overrides_in_place(getattr(module_config, key), val)
+        else:
+            setattr(module_config, key, val)
+
+
+def get_tcp_url(host: str, port: int) -> str:
+    """
+    Formats the TCP URL for the given host and port, handling IPv6 addresses correctly.
+
+    Args:
+        host (str): The hostname or IP address.
+        port (int): The port number.
+    Returns:
+        str: The formatted TCP URL.
+    """
+    try:
+        if isinstance(ipaddress.ip_address(host), ipaddress.IPv6Address):
+            return f"tcp://[{host}]:{port}"
+    except ValueError:
+        # not a literal IP, probably a hostname
+        pass
+    return f"tcp://{host}:{port}"
+
+
+def get_free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
